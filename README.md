@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="Assets/logo.webp" alt="TinyKullan Logo" width="120px">
+<img src="logo.webp" alt="TinyKullan Logo" width="120px">
 
 # 🎲 TinyKullan
 
