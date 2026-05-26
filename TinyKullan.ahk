@@ -1,5 +1,5 @@
 #Requires AutoHotkey v2.0
-; #SingleInstance Force removed — Python manages subprocess lifecycle
+#SingleInstance Off
 SendMode "Input"
 SetWorkingDir A_ScriptDir
 
@@ -26,6 +26,8 @@ Global WindowsMouseHook := 0
 Global SpeedMultiplier := 1.0
 
 ; Command line argument parsing
+Global ImgClickX := 0
+Global ImgClickY := 0
 for index, arg in A_Args {
     if (arg = "/play" and index + 1 <= A_Args.Length) {
         Mode := "Play"
@@ -38,6 +40,10 @@ for index, arg in A_Args {
         Mode := "Record"
         MacroPath := A_Args[index + 1]
         StopPath := MacroPath ".stop"
+    } else if (arg = "/imgclick" and index + 2 <= A_Args.Length) {
+        Mode := "ImgClick"
+        ImgClickX := Integer(A_Args[index + 1])
+        ImgClickY := Integer(A_Args[index + 2])
     }
 }
 
@@ -49,6 +55,21 @@ If (Mode = "Play") {
 } Else if (Mode = "Record") {
     StartRecording()
     Return
+} Else if (Mode = "ImgClick") {
+    ; Use Event mode (mouse_event API) — Roblox accepts this unlike SendInput
+    SendMode("Event")
+    CoordMode("Mouse", "Screen")
+    ; Activate Roblox so the click lands on it
+    if WinExist("ahk_exe RobloxPlayerBeta.exe") {
+        WinActivate("ahk_exe RobloxPlayerBeta.exe")
+        WinWaitActive("ahk_exe RobloxPlayerBeta.exe",, 1)
+    }
+    MouseMove(ImgClickX, ImgClickY, 0)
+    Sleep(50)
+    Click("down")
+    Sleep(50)
+    Click("up")
+    ExitApp()
 }
 
 ; UI Creation (Standalone mode)
@@ -462,8 +483,10 @@ SendMouseWheelInput(delta, dwFlags) {
 }
 
 ReleaseAllHeld(exitReason := 0, exitCode := 0) {
+    Global Mode, HeldLeft, HeldRight, HeldMiddle
+    if (Mode = "ImgClick")
+        Return
     ; Release mouse buttons only if held during playback
-    Global HeldLeft, HeldRight, HeldMiddle
     if (HeldLeft)
         SendMouseInput(0, 0, 0x0004)
     if (HeldRight)
