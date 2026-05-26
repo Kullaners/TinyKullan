@@ -14,6 +14,10 @@
 
 *Record. Replay. Share. Let it Grind while you Rest.*
 
+<br>
+
+<img src="preview.gif" alt="TinyKullan Preview" width="600px">
+
 </div>
 
 ---
