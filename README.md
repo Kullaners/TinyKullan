@@ -1,7 +1,3 @@
-#TinyKullan
-
-<img src="Assets/ScreenShots/banner.png" alt="TinyKullan Banner" width="100%">
-
 # 🎲 TinyKullan
 
 **A universal macro automation tool for Roblox tower defense games**
@@ -11,7 +7,7 @@
 [![License](https://img.shields.io/badge/License-GPL--3.0-green?style=for-the-badge)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/Kullaners/TinyKullan?style=for-the-badge&color=yellow)](https://github.com/Kullaners/TinyKullan/stargazers)
 
-*Record. Replay. Share. Grind smarter — not harder.*
+*Record. Replay. Share. Let it Grind while you Rest.*
 
 </div>
 
@@ -95,6 +91,7 @@ Whether you're farming waves, automating unit placement, or building the perfect
 - **Windows 10 / 11**
 - **Python 3.10+**
 - **Dependencies** (auto-installed via `python installer.bat`):
+- **AutoHotKey V2** - https://www.autohotkey.com/
 
 ```
 pynput
@@ -113,9 +110,8 @@ keyboard
 
 1. **Download** the latest release zip and extract it
 2. Run **`python installer.bat`** to install all dependencies automatically
-3. Launch **`TinyKullan.vbs`** to start the app (no console window)
-
-> ℹ️ AutoHotkey (v1 or v2) is optional — required only for `.ahk` macro export
+3. Download AutoHotkey from their site - https://www.autohotkey.com/
+3. Launch **`TinyKullan.vbs`** to start the app
 
 ---
 
@@ -160,12 +156,6 @@ TinyKullan/
 ├── TinyKullan.vbs          # Silent launcher (no console)
 └── python installer.bat    # Dependency installer
 ```
-
----
-
-## 📸 Screenshots
-
-> *Coming soon — add your screenshots to `Assets/ScreenShots/` and link them here*
 
 ---
 
