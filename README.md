@@ -1,3 +1,7 @@
+<div align="center">
+
+<img src="Assets/logo.webp" alt="TinyKullan Logo" width="120px">
+
 # 🎲 TinyKullan
 
 **A universal macro automation tool for Roblox tower defense games**
@@ -5,6 +9,7 @@
 [![Made with Python](https://img.shields.io/badge/Made%20with-Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Kullaners/TinyKullan)
 [![License](https://img.shields.io/badge/License-GPL--3.0-green?style=for-the-badge)](LICENSE)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/ydtJbc2u9a)
 [![Stars](https://img.shields.io/github/stars/Kullaners/TinyKullan?style=for-the-badge&color=yellow)](https://github.com/Kullaners/TinyKullan/stargazers)
 
 *Record. Replay. Share. Let it Grind while you Rest.*
@@ -18,6 +23,8 @@
 **TinyKullan** is a lightweight yet powerful macro automation tool designed for Roblox tower defense games. It lets you record mouse and keyboard actions, replay them with precision, and share your entire setup with others using a single **Base64 shareable code** — images included.
 
 Whether you're farming waves, automating unit placement, or building the perfect run, TinyKullan keeps it tight and repeatable.
+
+> 💬 **Need help or want to share your macros?** Join the community on [Discord](https://discord.gg/ydtJbc2u9a)!
 
 ---
 
@@ -90,8 +97,8 @@ Whether you're farming waves, automating unit placement, or building the perfect
 
 - **Windows 10 / 11**
 - **Python 3.10+**
+- **AutoHotKey V2** — https://www.autohotkey.com/
 - **Dependencies** (auto-installed via `python installer.bat`):
-- **AutoHotKey V2** - https://www.autohotkey.com/
 
 ```
 pynput
@@ -110,8 +117,8 @@ keyboard
 
 1. **Download** the latest release zip and extract it
 2. Run **`python installer.bat`** to install all dependencies automatically
-3. Download AutoHotkey from their site - https://www.autohotkey.com/
-3. Launch **`TinyKullan.vbs`** to start the app
+3. Download and install **AutoHotkey V2** from https://www.autohotkey.com/
+4. Launch **`TinyKullan.vbs`** to start the app
 
 ---
 
@@ -152,6 +159,7 @@ TinyKullan/
 │   ├── run_favorites.json  # Favorited runs
 │   └── runs/               # Saved macro run files
 ├── Assets/
+│   ├── logo.webp           # Project logo
 │   └── ScreenShots/        # Auto-captured screenshots
 ├── TinyKullan.vbs          # Silent launcher (no console)
 └── python installer.bat    # Dependency installer
@@ -168,13 +176,15 @@ See [LICENSE](LICENSE) for the full text.
 
 ## 🤝 Contributing
 
-Pull requests are welcome! If you find a bug or have a feature idea, open an issue.
+Pull requests are welcome! If you find a bug or have a feature idea, open an issue or drop by the [Discord server](https://discord.gg/ydtJbc2u9a).
 
 ---
 
 <div align="center">
 
 Made with 💜 for the Roblox grinders
+
+[![Discord](https://img.shields.io/badge/Join%20the%20Community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/ydtJbc2u9a)
 
 **[⭐ Star this repo](https://github.com/Kullaners/TinyKullan)** if TinyKullan saves you time!
 
