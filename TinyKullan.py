@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
+import ctypes
+
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    pass
+import ctypes as _ct
 import logging
 import sys
-
-
-
-import ctypes as _ct
 
 try:
     _ct.windll.kernel32.FreeConsole()
 except Exception:
     pass
 
+import atexit
 import base64
 import configparser
 import http.server
@@ -21,7 +25,6 @@ import time
 import tkinter as tk
 import tkinter.messagebox
 import webbrowser
-
 import winsound
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -37,6 +40,7 @@ def get_cached_template(image_path: str):
     cv2 is imported on first call only, keeping GUI startup instant.
     """
     import cv2
+
     if not image_path or not os.path.exists(image_path):
         return None
     try:
@@ -48,15 +52,17 @@ def get_cached_template(image_path: str):
 from tkinter import colorchooser, filedialog, ttk
 
 try:
+    import cv2
     import mss as _mss
+
+    # cv2 and numpy are lazy-loaded via get_cached_template() for fast startup
+    import numpy as np  # kept for inline uses in _find_best_match / _check_images
     import requests
-    from discord_webhook import DiscordWebhook, DiscordEmbed
+    from discord_webhook import DiscordEmbed, DiscordWebhook
     from PIL import Image, ImageGrab, ImageTk
     from pynput import keyboard as _pkb
     from pynput import mouse as _pmouse
-    # cv2 and numpy are lazy-loaded via get_cached_template() for fast startup
-    import numpy as np  # kept for inline uses in _find_best_match / _check_images
-    import cv2
+
     cv2_present = True
     np_present = True
 except ImportError as e:
@@ -72,11 +78,20 @@ except ImportError as e:
 try:
     import keyboard as _kb
 except ImportError:
+
     class MockKeyboard:
-        def hook(self, *a, **k): return None
-        def unhook(self, *a, **k): pass
-        def unhook_all_hotkeys(self, *a, **k): pass
-        def add_hotkey(self, *a, **k): pass
+        def hook(self, *a, **k):
+            return None
+
+        def unhook(self, *a, **k):
+            pass
+
+        def unhook_all_hotkeys(self, *a, **k):
+            pass
+
+        def add_hotkey(self, *a, **k):
+            pass
+
     _kb = MockKeyboard()
 
 try:
@@ -95,11 +110,12 @@ ULONG_PTR = _ct.c_size_t
 if sys.platform == "win32":
     user32 = _ct.windll.user32
     from ctypes import wintypes
+
     try:
         _ct.windll.winmm.timeBeginPeriod(1)
     except Exception:
         pass
-    
+
     class MOUSEINPUT(_ct.Structure):
         _fields_ = (
             ("dx", wintypes.LONG),
@@ -284,7 +300,9 @@ if sys.platform == "win32":
     user32.SetWindowPos.restype = wintypes.BOOL
 
     # Window procedure callback type (LRESULT CALLBACK(HWND, UINT, WPARAM, LPARAM))
-    _WNDPROC = _ct.WINFUNCTYPE(_ct.c_long, wintypes.HWND, wintypes.UINT, _ct.c_size_t, _ct.c_size_t)
+    _WNDPROC = _ct.WINFUNCTYPE(
+        _ct.c_long, wintypes.HWND, wintypes.UINT, _ct.c_size_t, _ct.c_size_t
+    )
 
 _WM_TASKBARCREATED = 0
 
@@ -311,10 +329,14 @@ def _send_input(*inputs):
 
 def _find_autohotkey():
     import winreg
+
     try:
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"AutoHotkeyScript\Shell\Open\Command") as key:
+        with winreg.OpenKey(
+            winreg.HKEY_CLASSES_ROOT, r"AutoHotkeyScript\Shell\Open\Command"
+        ) as key:
             val, _ = winreg.QueryValue(key, "")
             import re
+
             m = re.search(r'"([^"]+)"', val)
             if m:
                 cmd_path = m.group(1)
@@ -352,8 +374,9 @@ def _find_autohotkey():
             for p in paths:
                 if os.path.exists(p):
                     return p
-                    
+
     import shutil
+
     p = shutil.which("AutoHotkey") or shutil.which("AutoHotkey.exe")
     if p:
         return p
@@ -366,13 +389,17 @@ def _ahk_imgclick(x, y):
     This bypasses Python SendInput so Roblox accepts the click.
     Falls back to SetCursorPos + _send_input if AHK is unavailable."""
     import subprocess
+
     try:
         ahk = _find_autohotkey()
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "TinyKullan.ahk")
+        script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "TinyKullan.ahk"
+        )
         if os.path.exists(script):
             proc = subprocess.Popen(
                 [ahk, script, "/imgclick", str(int(x)), str(int(y))],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             proc.wait(timeout=2)
             return
@@ -386,42 +413,108 @@ def _ahk_imgclick(x, y):
     _send_input(_mouse_button("left", True))
 
 
+# ── AHK persistent worker (module-level state) ────────────────────────────────
+_ahk_worker_proc = None  # subprocess.Popen handle
+_ahk_worker_script = None  # resolved path to TinyKullan.ahk
+_ahk_worker_lock = None  # threading.Lock, initialised on first use
+
+
+def _get_ahk_worker_lock():
+    global _ahk_worker_lock
+    if _ahk_worker_lock is None:
+        _ahk_worker_lock = threading.Lock()
+    return _ahk_worker_lock
+
+
+def _start_ahk_worker(self):
+    """Launch TinyKullan.ahk once with /worker and keep the Popen reference."""
+    import subprocess
+
+    global _ahk_worker_proc, _ahk_worker_script
+
+    with _get_ahk_worker_lock():
+        if _ahk_worker_proc is not None and _ahk_worker_proc.poll() is None:
+            return True
+
+        try:
+            ahk = _find_autohotkey()
+            script = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "TinyKullan.ahk"
+            )
+            if not os.path.exists(script):
+                return False
+
+            _ahk_worker_script = script
+            _ahk_worker_proc = subprocess.Popen(
+                [ahk, script, "/worker"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:
+            _ahk_worker_proc = None
+            return False
+
+
+def _ahk_send_command(self, cmd):
+    """Write *cmd* to a temp signal file that the AHK /worker process polls."""
+    global _ahk_worker_proc
+
+    with _get_ahk_worker_lock():
+        if _ahk_worker_proc is None or _ahk_worker_proc.poll() is not None:
+            return False
+
+    try:
+        tmp_dir = (
+            os.environ.get("TEMP")
+            or os.environ.get("TMP")
+            or os.path.dirname(os.path.abspath(__file__))
+        )
+        signal_path = os.path.join(tmp_dir, "TinyKullan_ahk_cmd.txt")
+        with open(signal_path, "w", encoding="utf-8") as fh:
+            fh.write(cmd + "\n")
+        return True
+    except Exception:
+        return False
+
+
 def _write_csv_macro(events, filepath):
-    content = []
-    # M-5 fix: add custom_name as 11th column (URL-encoded to avoid delimiter issues)
+    import csv
     import urllib.parse
-    for ev in events:
-        t = ev.get("t", "")
-        d = int(ev.get("d", 0))
-        x = int(ev.get("x", 0))
-        y = int(ev.get("y", 0))
-        btn = ev.get("btn", ev.get("b", ""))
-        if "up" in ev:
-            up = 1 if ev.get("up", False) else 0
-        else:
-            up = 1 if ev.get("s", "Down") == "Up" else 0
-        vk = int(ev.get("vk", 0))
-        scan = int(ev.get("scan", ev.get("sc", 0)))
-        ext = 1 if ev.get("ext", False) else 0
-        delta = int(ev.get("delta", 0))
-        custom_name = urllib.parse.quote(ev.get("custom_name", ""), safe="")
-        content.append(f"{t},{d},{x},{y},{btn},{up},{vk},{scan},{ext},{delta},{custom_name}")
-    
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write("\n".join(content) + "\n")
+
+    with open(filepath, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, lineterminator="\n")
+        for ev in events:
+            t = ev.get("t", "")
+            d = int(ev.get("d", 0))
+            x = int(ev.get("x", 0))
+            y = int(ev.get("y", 0))
+            btn = ev.get("btn", ev.get("b", ""))
+            if "up" in ev:
+                up = 1 if ev.get("up", False) else 0
+            else:
+                up = 1 if ev.get("s", "Down") == "Up" else 0
+            vk = int(ev.get("vk", 0))
+            scan = int(ev.get("scan", ev.get("sc", 0)))
+            ext = 1 if ev.get("ext", False) else 0
+            delta = int(ev.get("delta", 0))
+            custom_name = urllib.parse.quote(ev.get("custom_name", ""), safe="")
+            writer.writerow([t, d, x, y, btn, up, vk, scan, ext, delta, custom_name])
 
 
 def _read_csv_macro(filepath):
     if not os.path.exists(filepath):
         return []
-    
+
+    import csv
+    import urllib.parse
+
     events = []
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    with open(filepath, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        for parts in reader:
+            if not parts:
                 continue
-            parts = line.split(",")
             if len(parts) < 10:
                 continue
             t = parts[0]
@@ -434,12 +527,10 @@ def _read_csv_macro(filepath):
             scan = int(parts[7])
             ext = parts[8] == "1"
             delta = int(parts[9])
-            # M-5 fix: parse optional 11th column (custom_name)
             custom_name = ""
             if len(parts) >= 11:
-                import urllib.parse
                 custom_name = urllib.parse.unquote(parts[10])
-            
+
             ev = {
                 "t": t,
                 "d": d,
@@ -449,7 +540,7 @@ def _read_csv_macro(filepath):
                 "vk": vk,
                 "scan": scan,
                 "ext": ext,
-                "delta": delta
+                "delta": delta,
             }
             if custom_name:
                 ev["custom_name"] = custom_name
@@ -731,7 +822,21 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
-WW, TH, BH, CW = 343, 28, 54, 49
+
+
+class _UIGrid:
+    """Responsive grid config — edit once, propagates everywhere."""
+
+    WW: int = 343  # window width
+    TH: int = 28  # title-bar height
+    BH: int = 54  # button-bar height
+    CW: int = 49  # column width
+
+
+_UI = _UIGrid()
+WW, TH, BH, CW = _UI.WW, _UI.TH, _UI.BH, _UI.CW
+
+
 def _get_save_dir():
     # Dynamic cross-platform desktop/documents directory detector
     desktop = Path.home() / "Desktop"
@@ -741,6 +846,7 @@ def _get_save_dir():
     if documents.is_dir():
         return documents / "TinyKullan"
     return Path.home() / "TinyKullan"
+
 
 BASE_SAVE_PATH = _get_save_dir()
 INI_PATH = BASE_SAVE_PATH / "Saves" / "TinyKullan.ini"
@@ -926,24 +1032,45 @@ def _ping():
 def _pick_directory(parent=None, title="Select Folder", initial_dir=None):
     if initial_dir is None:
         initial_dir = str(Path.home())
-    return filedialog.askdirectory(parent=parent, title=title, initialdir=initial_dir) or ""
+    return (
+        filedialog.askdirectory(parent=parent, title=title, initialdir=initial_dir)
+        or ""
+    )
 
 
 def _pick_file(parent=None, title="Select File", filetypes=None, initial_dir=None):
     if initial_dir is None:
         initial_dir = str(Path.home())
-    return filedialog.askopenfilename(
-        parent=parent, title=title, filetypes=filetypes or [], initialdir=initial_dir
-    ) or ""
+    return (
+        filedialog.askopenfilename(
+            parent=parent,
+            title=title,
+            filetypes=filetypes or [],
+            initialdir=initial_dir,
+        )
+        or ""
+    )
 
 
-def _save_file(parent=None, title="Save File", default_ext=".json", filetypes=None, initial_dir=None):
+def _save_file(
+    parent=None,
+    title="Save File",
+    default_ext=".json",
+    filetypes=None,
+    initial_dir=None,
+):
     if initial_dir is None:
         initial_dir = str(Path.home())
-    return filedialog.asksaveasfilename(
-        parent=parent, title=title, defaultextension=default_ext,
-        filetypes=filetypes or [], initialdir=initial_dir
-    ) or ""
+    return (
+        filedialog.asksaveasfilename(
+            parent=parent,
+            title=title,
+            defaultextension=default_ext,
+            filetypes=filetypes or [],
+            initialdir=initial_dir,
+        )
+        or ""
+    )
 
 
 def _ms():
@@ -1012,6 +1139,7 @@ class Config:
         self.tiny_play: bool = True
         self.tiny_loop: bool = True
         self.tiny_save: bool = True
+        self.tiny_pause: bool = True
         self.tiny_delete: bool = True
         self.tiny_edit: bool = True
         self.tiny_settings: bool = True
@@ -1073,6 +1201,7 @@ class Config:
             "tiny_play": True,
             "tiny_loop": True,
             "tiny_save": True,
+            "tiny_pause": True,
             "tiny_delete": True,
             "tiny_edit": True,
             "tiny_settings": True,
@@ -1164,6 +1293,7 @@ class Config:
         self.tiny_play = b("UI", "TinyPlay", True)
         self.tiny_loop = b("UI", "TinyLoop", True)
         self.tiny_save = b("UI", "TinySave", True)
+        self.tiny_pause = b("UI", "TinyPause", True)
         self.tiny_delete = b("UI", "TinyDelete", True)
         self.tiny_edit = b("UI", "TinyEdit", True)
         self.tiny_settings = b("UI", "TinySettings", True)
@@ -1267,6 +1397,7 @@ class Config:
                     "play",
                     "loop",
                     "save",
+                    "pause",
                     "delete",
                     "edit",
                     "settings",
@@ -1488,7 +1619,7 @@ class HotkeyEntry:
         self._hk_listener = _pkb.Listener(
             on_press=self._on_pynput_press,
             on_release=self._on_pynput_release,
-            suppress=True
+            suppress=True,
         )
         self._hk_listener.start()
 
@@ -1505,6 +1636,7 @@ class HotkeyEntry:
 
     def _pynput_key_str(self, key):
         from pynput.keyboard import Key, KeyCode
+
         if isinstance(key, Key):
             return _normalize_key_name(str(key).replace("Key.", ""))
         elif isinstance(key, KeyCode):
@@ -1598,12 +1730,18 @@ class App:
         self._sleeping = False
         self._focused = True
         self._ss_lock = threading.Lock()
-        self._click_lock = threading.Lock()          # S-2: protects _clicked_this_run set
-        self._stats_lock = threading.Lock()          # S-9: protects stats increment + save
-        self._held_lock = threading.Lock()           # S-5: protects _held_vks/_held_keys/_held_btns
-        self._img_cache_lock = threading.Lock()      # S-1: protects image_det_list reads (template cache uses @lru_cache)
+        self._click_lock = threading.Lock()  # S-2: protects _clicked_this_run set
+        self._stats_lock = threading.Lock()  # S-9: protects stats increment + save
+        self._held_lock = (
+            threading.Lock()
+        )  # S-5: protects _held_vks/_held_keys/_held_btns
+        self._img_cache_lock = (
+            threading.Lock()
+        )  # S-1: protects image_det_list reads (template cache uses @lru_cache)
         self._recovering = False
-        self._recover_lock = threading.Lock()        # C-2: protects _recovering state transitions
+        self._recover_lock = (
+            threading.Lock()
+        )  # C-2: protects _recovering state transitions
         self._last_move_x = self._last_move_y = 0
         self._last_move_ms = 0
         self._cached_bounds_ts = 0
@@ -1636,7 +1774,9 @@ class App:
         if sys.platform == "win32":
             self._orig_beep = wintypes.BOOL()
             try:
-                user32.SystemParametersInfoW(SPI_GETBEEP, 0, _ct.byref(self._orig_beep), 0)
+                user32.SystemParametersInfoW(
+                    SPI_GETBEEP, 0, _ct.byref(self._orig_beep), 0
+                )
             except Exception:
                 self._orig_beep.value = 1
             try:
@@ -1653,15 +1793,16 @@ class App:
         except Exception:
             _LOG.warning("Tray setup failed", exc_info=True)
             self._tray_added = False
+        atexit.register(self._remove_tray)
 
         self._register_hotkeys()
         self._setup_focus_suppression()
-        
+
         # Start permanent global keyboard listener for reliable hotkeys and recording
         self._global_kb_listener = _pkb.Listener(
             on_press=self._global_on_press,
             on_release=self._global_on_release,
-            suppress=False
+            suppress=False,
         )
         self._global_kb_listener.start()
         if self.cfg.save_path and Path(self.cfg.save_path).is_file():
@@ -1689,7 +1830,12 @@ class App:
         self.root.resizable(False, False)
         sw = self.root.winfo_screenwidth()
         self.root.geometry(f"{WW}x{TH + 1 + BH}+{(sw - WW) // 2}+40")
-        self.root._app_busy = lambda: self.recording or self.playing
+        self.root._app_busy = lambda: (
+            self.recording
+            or self.playing
+            or self.autoclicking
+            or getattr(self, "running_all_images", False)
+        )
 
         self._tb = tk.Frame(
             self.root, bg=_C["top"], height=TH, bd=0, highlightthickness=0
@@ -1849,7 +1995,7 @@ class App:
                 "play": self.cfg.tiny_play,
                 "loop": self.cfg.tiny_loop,
                 "save": self.cfg.tiny_save,
-                "pause": self.cfg.tiny_delete,
+                "pause": self.cfg.tiny_pause,
                 "edit": self.cfg.tiny_edit,
                 "settings": True,
             }
@@ -2696,11 +2842,31 @@ class App:
             pass
         # Emergency key release: brute-force all modifier VKs
         _EMERGENCY_VKS = (
-            0x10, 0x11, 0x12, 0x5B, 0x5C,        # Shift, Ctrl, Alt, Win L/R
-            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,   # L/R variants
-            0x1B, 0x20, 0x0D, 0x09, 0x08, 0x2E,   # Esc, Space, Enter, Tab, BS, Del
-            0x25, 0x26, 0x27, 0x28,                # Arrow keys
-            0x57, 0x41, 0x53, 0x44,                # WASD
+            0x10,
+            0x11,
+            0x12,
+            0x5B,
+            0x5C,  # Shift, Ctrl, Alt, Win L/R
+            0xA0,
+            0xA1,
+            0xA2,
+            0xA3,
+            0xA4,
+            0xA5,  # L/R variants
+            0x1B,
+            0x20,
+            0x0D,
+            0x09,
+            0x08,
+            0x2E,  # Esc, Space, Enter, Tab, BS, Del
+            0x25,
+            0x26,
+            0x27,
+            0x28,  # Arrow keys
+            0x57,
+            0x41,
+            0x53,
+            0x44,  # WASD
         )
         for vk in _EMERGENCY_VKS:
             try:
@@ -2714,9 +2880,25 @@ class App:
             pass
         try:
             if sys.platform == "win32" and self._orig_beep is not None:
-                user32.SystemParametersInfoW(SPI_SETBEEP, self._orig_beep.value, None, 0)
+                user32.SystemParametersInfoW(
+                    SPI_SETBEEP, self._orig_beep.value, None, 0
+                )
         except Exception:
             pass
+        # Bug 1: Stop pynput mouse listener if active
+        if self._mouse_l:
+            try:
+                self._mouse_l.stop()
+            except Exception:
+                pass
+
+        # Bug 15: Stop the global keyboard listener so the process can exit cleanly
+        if self._global_kb_listener:
+            try:
+                self._global_kb_listener.stop()
+            except Exception:
+                pass
+
         if hasattr(self, "master") and self.master:
             self.master.destroy()
         else:
@@ -2727,8 +2909,17 @@ class App:
         self._hotkey_defs = []
         self._hotkey_map = {}  # Fast direct VK→func lookup for simple hotkeys
         _MODIFIER_VKS = {
-            0x10, 0x11, 0x12, 0x5B, 0x5C,
-            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+            0x10,
+            0x11,
+            0x12,
+            0x5B,
+            0x5C,
+            0xA0,
+            0xA1,
+            0xA2,
+            0xA3,
+            0xA4,
+            0xA5,
         }
         for hk, f in [
             (self.cfg.key_record, self.toggle_record),
@@ -2774,12 +2965,15 @@ class App:
             return
 
         # Catch OS auto-repeat spam
-        is_auto_repeat = (vk in self._currently_pressed_vks)
-        
+        is_auto_repeat = vk in self._currently_pressed_vks
+
         self._currently_pressed_vks.add(vk)
-        if vk == 0x10: self._currently_pressed_vks.update({0xA0, 0xA1})
-        elif vk == 0x11: self._currently_pressed_vks.update({0xA2, 0xA3})
-        elif vk == 0x12: self._currently_pressed_vks.update({0xA4, 0xA5})
+        if vk == 0x10:
+            self._currently_pressed_vks.update({0xA0, 0xA1})
+        elif vk == 0x11:
+            self._currently_pressed_vks.update({0xA2, 0xA3})
+        elif vk == 0x12:
+            self._currently_pressed_vks.update({0xA4, 0xA5})
 
         if getattr(self, "_hk_suppressed", False):
             self._on_key_press(key)
@@ -2792,15 +2986,27 @@ class App:
                 matched = True
                 for h_vk in hk_vk_set:
                     if h_vk in (0x10, 0xA0, 0xA1):
-                        if not (0x10 in self._currently_pressed_vks or 0xA0 in self._currently_pressed_vks or 0xA1 in self._currently_pressed_vks):
+                        if not (
+                            0x10 in self._currently_pressed_vks
+                            or 0xA0 in self._currently_pressed_vks
+                            or 0xA1 in self._currently_pressed_vks
+                        ):
                             matched = False
                             break
                     elif h_vk in (0x11, 0xA2, 0xA3):
-                        if not (0x11 in self._currently_pressed_vks or 0xA2 in self._currently_pressed_vks or 0xA3 in self._currently_pressed_vks):
+                        if not (
+                            0x11 in self._currently_pressed_vks
+                            or 0xA2 in self._currently_pressed_vks
+                            or 0xA3 in self._currently_pressed_vks
+                        ):
                             matched = False
                             break
                     elif h_vk in (0x12, 0xA4, 0xA5):
-                        if not (0x12 in self._currently_pressed_vks or 0xA4 in self._currently_pressed_vks or 0xA5 in self._currently_pressed_vks):
+                        if not (
+                            0x12 in self._currently_pressed_vks
+                            or 0xA4 in self._currently_pressed_vks
+                            or 0xA5 in self._currently_pressed_vks
+                        ):
                             matched = False
                             break
                     else:
@@ -2825,9 +3031,12 @@ class App:
             return
 
         self._currently_pressed_vks.discard(vk)
-        if vk == 0x10: self._currently_pressed_vks.difference_update({0xA0, 0xA1})
-        elif vk == 0x11: self._currently_pressed_vks.difference_update({0xA2, 0xA3})
-        elif vk == 0x12: self._currently_pressed_vks.difference_update({0xA4, 0xA5})
+        if vk == 0x10:
+            self._currently_pressed_vks.difference_update({0xA0, 0xA1})
+        elif vk == 0x11:
+            self._currently_pressed_vks.difference_update({0xA2, 0xA3})
+        elif vk == 0x12:
+            self._currently_pressed_vks.difference_update({0xA4, 0xA5})
 
         self._on_key_release(key)
 
@@ -2855,6 +3064,7 @@ class App:
 
     def _panic(self):
         _LOG.warning("PANIC STOP")
+        # Bug 14: Add _stop_listeners method
         self._stop_listeners()
         self.recording = False
         self._stop_ev.set()
@@ -2874,6 +3084,21 @@ class App:
         self.root.after(0, self._reset_ui)
         self.root.after(0, lambda: self.set_status("⚠ PANIC", _C["rec"], 5000))
 
+    # Bug 14
+    def _stop_listeners(self):
+        if self._mouse_l:
+            try:
+                self._mouse_l.stop()
+            except Exception:
+                pass
+            self._mouse_l = None
+        if self._kb_l:
+            try:
+                self._kb_l.stop()
+            except Exception:
+                pass
+            self._kb_l = None
+
     def toggle_record(self):
         if self.playing or self.looping or getattr(self, "running_all_images", False):
             if getattr(self, "running_all_images", False):
@@ -2884,6 +3109,10 @@ class App:
         self._stop_recording() if self.recording else self._start_recording()
 
     def toggle_autoclick(self):
+        # Bug 24: Guard against starting autoclicker during recording/playback
+        if self.recording or self.playing or self.looping:
+            self.set_status("Macro busy!", _C["rec"], 1500)
+            return
         self.autoclicking = not self.autoclicking
         if self.autoclicking:
             self._autoclick_stop_ev.clear()
@@ -2933,13 +3162,13 @@ class App:
         except Exception:
             self._last_move_x = self._last_move_y = 0
         self._last_move_ms = self._last_ms
-        
+
         self.c_rec.ico.config(text="⏹")
         self.c_rec.lbl.config(text="Stop")
         self.set_status("⏺ REC", _C["rec"])
         self._anim_tick()
         self._build_hk_vks()
-        
+
         try:
             ahk_path = _find_autohotkey()
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2949,7 +3178,10 @@ class App:
             if not os.path.exists(ahk_path):
                 raise FileNotFoundError(f"AutoHotkey not found: {ahk_path}")
             import tempfile
-            macro_temp = os.path.join(tempfile.gettempdir(), f"tkmacro_record_{os.getpid()}.txt")
+
+            macro_temp = os.path.join(
+                tempfile.gettempdir(), f"tkmacro_record_{os.getpid()}.txt"
+            )
             stop_temp = macro_temp + ".stop"
             for temp_path in (macro_temp, stop_temp):
                 if os.path.exists(temp_path):
@@ -2957,20 +3189,34 @@ class App:
             self._record_macro_temp = macro_temp
             self._record_stop_temp = stop_temp
             self._record_stop_pending = False
-                
+
             import subprocess
-            _LOG.info("AHK RECORD: exe=%s  script=%s", os.path.abspath(ahk_path), os.path.abspath(ahk_script))
+
+            _LOG.info(
+                "AHK RECORD: exe=%s  script=%s",
+                os.path.abspath(ahk_path),
+                os.path.abspath(ahk_script),
+            )
             self._ahk_proc = subprocess.Popen(
                 [ahk_path, ahk_script, "/record", macro_temp],
-                creationflags=0x08000000 if sys.platform == "win32" else 0
+                creationflags=0x08000000 if sys.platform == "win32" else 0,
             )
-            self._record_event = self._record_event_pynput  # Use pynput fallback recording
+            self._record_event = (
+                self._record_event_pynput
+            )  # Use pynput fallback recording
             self.root.after(100, self._monitor_recording, macro_temp)
         except Exception as e:
             _LOG.error("Failed to start AHK recorder: %s", e)
             self.set_status("AHK not found - using pynput", _C["loop"], 2000)
             self._ahk_proc = None
             self._record_event = self._record_event_pynput
+            # Bug 1: Start pynput mouse listener for fallback recording
+            self._mouse_l = _pmouse.Listener(
+                on_move=self._on_move,
+                on_click=self._on_click,
+                on_scroll=self._on_scroll,
+            )
+            self._mouse_l.start()
 
     def _monitor_recording(self, macro_temp):
         if self._ahk_proc is not None:
@@ -2978,18 +3224,18 @@ class App:
                 self._ahk_proc = None
                 self._stop_recording(from_ahk=True, macro_temp=macro_temp)
                 return
-                
+
         if self.recording or getattr(self, "_record_stop_pending", False):
             self.root.after(50, self._monitor_recording, macro_temp)
 
     def _stop_recording(self, from_ahk=False, macro_temp=None):
         if not self.recording and not from_ahk:
             return
-        
+
         if self._blink_after is not None:
             self.root.after_cancel(self._blink_after)
             self._blink_after = None
-            
+
         if not from_ahk and self._ahk_proc is not None:
             if getattr(self, "_record_stop_pending", False):
                 return
@@ -3027,14 +3273,22 @@ class App:
                     os.remove(macro_temp)
             except Exception as e:
                 _LOG.error("Failed to read recorded events: %s", e)
-                
+
+        # Bug 1: Stop pynput mouse listener if it was started (fallback mode)
+        if self._mouse_l:
+            try:
+                self._mouse_l.stop()
+            except Exception:
+                pass
+            self._mouse_l = None
+
         self._rec_dur = 0
         if self.events:
             self._rec_dur = sum(ev.get("d", 0) for ev in self.events)
 
         self.c_rec.ico.config(text=self.cfg.ico_record)
         self.c_rec.lbl.config(text="Record")
-        
+
         self.root.after(0, self._reset_ui)
         self.set_status(f"■ {len(self.events)} ev", _C["go"], 3000)
         threading.Thread(target=self._webhook, args=("record",), daemon=True).start()
@@ -3084,7 +3338,7 @@ class App:
             ev = dict(ev)
             ev["_ts_perf"] = time.perf_counter() - self._rec_start_perf
             self.events.append(ev)
-    
+
     def _record_event(self, ev, ts=None):
         self._record_event_pynput(ev, ts)
 
@@ -3093,7 +3347,7 @@ class App:
             return
         if self._cached_bounds(x, y):
             return
-            
+
         # Rate-limit mouse move recording to at most once every 5ms (200Hz)
         # to prevent event overload while keeping smooth movement
         now_ms = _ms()
@@ -3102,7 +3356,7 @@ class App:
         self._last_move_ms = now_ms
 
         xi, yi = int(x), int(y)
-        
+
         # Check if this move is a Roblox/game warp-back to client center
         try:
             hwnd = user32.GetForegroundWindow()
@@ -3125,9 +3379,7 @@ class App:
         dx = xi - self._last_move_x
         dy = yi - self._last_move_y
         self._last_move_x, self._last_move_y = xi, yi
-        self._record_event(
-            {"t": "M", "x": xi, "y": yi, "dx": dx, "dy": dy}
-        )
+        self._record_event({"t": "M", "d": 0, "x": xi, "y": yi, "dx": dx, "dy": dy})
 
     def _on_click(self, x, y, button, pressed):
         btn = _PYNPUT_BTN.get(button, str(button).split(".")[-1].lower())
@@ -3151,6 +3403,7 @@ class App:
         self._record_event(
             {
                 "t": "C",
+                "d": 0,
                 "btn": btn,
                 "up": not pressed,
                 "x": int(x),
@@ -3165,6 +3418,7 @@ class App:
             self._record_event(
                 {
                     "t": "W",
+                    "d": 0,
                     "delta": int(dy * 120),
                     "x": int(x),
                     "y": int(y),
@@ -3174,6 +3428,7 @@ class App:
             self._record_event(
                 {
                     "t": "WH",
+                    "d": 0,
                     "delta": int(dx * 120),
                     "x": int(x),
                     "y": int(y),
@@ -3184,12 +3439,23 @@ class App:
         vk, scan, ext = _key_to_vk(key)
         if vk:
             _KMAP = {
-                0x10: "sh", 0xA0: "sh", 0xA1: "sh",
-                0x11: "ct", 0xA2: "ct", 0xA3: "ct",
-                0x12: "al", 0xA4: "al", 0xA5: "al",
-                0x5B: "wn", 0x5C: "wn",
-                0x20: "sp", 0x0D: "en", 0x09: "tb",
-                0x1B: "es", 0x08: "bk", 0x2E: "de",
+                0x10: "sh",
+                0xA0: "sh",
+                0xA1: "sh",
+                0x11: "ct",
+                0xA2: "ct",
+                0xA3: "ct",
+                0x12: "al",
+                0xA4: "al",
+                0xA5: "al",
+                0x5B: "wn",
+                0x5C: "wn",
+                0x20: "sp",
+                0x0D: "en",
+                0x09: "tb",
+                0x1B: "es",
+                0x08: "bk",
+                0x2E: "de",
             }
             txt = _KMAP.get(vk) or (
                 chr(vk).lower()
@@ -3202,7 +3468,9 @@ class App:
         if vk in self._rec_pressed_keys:
             return
         self._rec_pressed_keys.add(vk)
-        self._record_event({"t": "K", "vk": vk, "scan": scan, "ext": ext, "up": False})
+        self._record_event(
+            {"t": "K", "d": 0, "vk": vk, "scan": scan, "ext": ext, "up": False}
+        )
 
     def _on_key_release(self, key):
         vk, scan, ext = _key_to_vk(key)
@@ -3213,7 +3481,9 @@ class App:
         if vk not in self._rec_pressed_keys:
             return
         self._rec_pressed_keys.discard(vk)
-        self._record_event({"t": "K", "vk": vk, "scan": scan, "ext": ext, "up": True})
+        self._record_event(
+            {"t": "K", "d": 0, "vk": vk, "scan": scan, "ext": ext, "up": True}
+        )
 
     def toggle_play(self):
         if not self._can_start():
@@ -3227,9 +3497,11 @@ class App:
         self.c_play.lbl.config(text="Stop")
         self.set_status("▶ Playing", _C["go"])
         self._anim_tick()
-        
+
         # Start AHK playback process in background thread
-        threading.Thread(target=self._ahk_playback_worker, args=(False,), daemon=True).start()
+        threading.Thread(
+            target=self._ahk_playback_worker, args=(False,), daemon=True
+        ).start()
 
     def toggle_loop(self):
         if not self._can_start():
@@ -3243,9 +3515,11 @@ class App:
         self.c_loop.lbl.config(text="Stop")
         self.set_status("∞ LOOP", _C["loop"])
         self._anim_tick()
-        
+
         # Start AHK playback process with looping in background thread
-        threading.Thread(target=self._ahk_playback_worker, args=(True,), daemon=True).start()
+        threading.Thread(
+            target=self._ahk_playback_worker, args=(True,), daemon=True
+        ).start()
 
     def _can_start(self):
         if self.recording:
@@ -3266,7 +3540,7 @@ class App:
         self._stop_ev.set()
         self._pause_playback = False
         self.playing = self.looping = False
-        
+
         # Terminate the running AHK process
         if self._ahk_proc is not None:
             try:
@@ -3274,11 +3548,20 @@ class App:
             except Exception:
                 pass
             self._ahk_proc = None
-            
+
         # Emergency release: AHK terminate() skips OnExit, so force-release all modifiers
         _EMERGENCY_VKS = (
-            0x10, 0x11, 0x12, 0x5B, 0x5C,        # Shift, Ctrl, Alt, Win L/R
-            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5   # L/R variants
+            0x10,
+            0x11,
+            0x12,
+            0x5B,
+            0x5C,  # Shift, Ctrl, Alt, Win L/R
+            0xA0,
+            0xA1,
+            0xA2,
+            0xA3,
+            0xA4,
+            0xA5,  # L/R variants
         )
         for vk in _EMERGENCY_VKS:
             try:
@@ -3286,12 +3569,19 @@ class App:
                 _send_input(_make_key(vk, sc, True, vk in _EXTENDED_VKS))
             except Exception:
                 pass
-            
+
         self.root.after(0, self._reset_ui)
         self.set_status("Stopped", None, 1500)
 
     def _toggle_pause(self):
-        self.set_status("Pause not supported in AHK mode", _C["rec"], 1500)
+        if self._ahk_proc is not None:
+            self.set_status("Pause not supported in AHK mode", _C["rec"], 1500)
+            return
+        self._pause_playback = not self._pause_playback
+        label = "Resume" if self._pause_playback else "Pause"
+        self.c_pause.ico.config(text="\u25b6" if self._pause_playback else "\u23f8")
+        self.c_pause.lbl.config(text=label)
+        self.set_status(label, _C["loop"])
 
     def _reset_ui(self):
         self._currently_pressed_vks.clear()
@@ -3315,16 +3605,20 @@ class App:
             ahk_path = _find_autohotkey()
             script_dir = os.path.dirname(os.path.abspath(__file__))
             ahk_script = os.path.join(script_dir, "TinyKullan.ahk")
-            
+
             if not os.path.exists(ahk_script) or not os.path.exists(ahk_path):
                 raise FileNotFoundError("AHK script or binary not found")
-                
+
             import tempfile
+
             _cleanup_macro_temp = None
             try:
                 with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".txt", prefix="tkmacro_", delete=False,
-                    encoding="utf-8"
+                    mode="w",
+                    suffix=".txt",
+                    prefix="tkmacro_",
+                    delete=False,
+                    encoding="utf-8",
                 ) as tf:
                     macro_temp = tf.name
                     _cleanup_macro_temp = macro_temp
@@ -3336,20 +3630,24 @@ class App:
             with self._ev_lock:
                 evs_snapshot = list(self.events)
             _write_csv_macro(evs_snapshot, macro_temp)
-            
+
             import subprocess
+
             args = [ahk_path, ahk_script, "/play", macro_temp]
             if loop:
                 args.append("/loop")
             speed = max(0.1, min(10.0, self.cfg.speed))
             if speed != 1.0:
                 args.extend(["/speed", str(speed)])
-            _LOG.info("AHK PLAY: exe=%s  script=%s", os.path.abspath(ahk_path), os.path.abspath(ahk_script))
-            self._ahk_proc = subprocess.Popen(
-                args,
-                creationflags=0x08000000 if sys.platform == "win32" else 0
+            _LOG.info(
+                "AHK PLAY: exe=%s  script=%s",
+                os.path.abspath(ahk_path),
+                os.path.abspath(ahk_script),
             )
-            
+            self._ahk_proc = subprocess.Popen(
+                args, creationflags=0x08000000 if sys.platform == "win32" else 0
+            )
+
             self._ahk_proc.wait()
             self._ahk_proc = None
 
@@ -3362,12 +3660,14 @@ class App:
                     os.remove(_cleanup_macro_temp)
             except Exception:
                 pass
-                
+
         except Exception as e:
             if getattr(self, "_recovering", False):
                 return
             _LOG.error("AHK playback failed, using Python fallback: %s", e)
-            self.root.after(0, lambda: self.set_status("AHK fail - Python mode", _C["loop"], 2000))
+            self.root.after(
+                0, lambda: self.set_status("AHK fail - Python mode", _C["loop"], 2000)
+            )
             # C-3 fix: guarantee flag reset even if fallback itself throws
             try:
                 self._playback_python_fallback(loop, t0)
@@ -3375,7 +3675,7 @@ class App:
                 self.playing = self.looping = False
                 self.root.after(0, self._reset_ui)
             return
-            
+
         play_ms = int((time.perf_counter() - t0) * 1000)
         self.playing = self.looping = False
         self.root.after(0, self._reset_ui)
@@ -3410,11 +3710,25 @@ class App:
                     if ev.get("t") == "B":
                         img_name = ev.get("name") or ev.get("img", "")
                         found = False
-                        if img_name and self.image_det_list:
-                            for det in self.image_det_list:
-                                if det.get("name") == img_name or Path(det.get("path", "")).name == img_name:
-                                    found = True
-                                    break
+                        if img_name:
+                            img_path = self._resolve_image_path(img_name)
+                            if img_path:
+                                try:
+                                    import cv2
+                                    import numpy as np
+
+                                    template = get_cached_template(img_path)
+                                    if template is not None:
+                                        screen = _grab_screen()
+                                        screen_bgr = cv2.cvtColor(
+                                            np.array(screen), cv2.COLOR_RGB2BGR
+                                        )
+                                        val, _ = self._find_best_match(
+                                            screen_bgr, template
+                                        )
+                                        found = val >= 0.55
+                                except Exception:
+                                    pass
                         if not found:
                             skip = max(1, int(ev.get("skip", 1)))
                             i += skip
@@ -3878,7 +4192,12 @@ h1{{font-size:30px}}
             self.set_status("Dashboard failed", _C["rec"], 2000)
 
     def _open_macro_editor(self):
+        # Bug 22: Guard against multiple editor windows
+        if hasattr(self, "_ed_win") and self._ed_win and self._ed_win.winfo_exists():
+            self._ed_win.lift()
+            return
         ed = tk.Toplevel(self.root)
+        self._ed_win = ed
         ed.title("Macro Editor")
         ed.configure(bg=SBG)
         ed.geometry("640x460+150+80")
@@ -3924,7 +4243,17 @@ h1{{font-size:30px}}
             cursor="hand2",
         )
         close_btn.pack(side="right", padx=4)
-        close_btn.bind("<Button-1>", lambda _: ed.destroy())
+        close_btn.bind("<Button-1>", lambda _: _on_ed_close())
+
+        # Bug 22: Clear editor window reference on close
+        def _on_ed_close():
+            self._ed_win = None
+            try:
+                ed.destroy()
+            except Exception:
+                pass
+
+        ed.protocol("WM_DELETE_WINDOW", _on_ed_close)
 
         # Main body: list + edit panel
         body = tk.Frame(ed, bg=SBG)
@@ -3934,59 +4263,90 @@ h1{{font-size:30px}}
         _filter_text = [""]  # mutable container for closure
         search_frame = tk.Frame(body, bg=SBG)
         search_frame.pack(fill="x", pady=(0, 4))
-        tk.Label(search_frame, text="🔍", bg=SBG, fg=SMUTED,
-                 font=("Segoe UI", 8)).pack(side="left", padx=(0, 4))
-        _search_entry = tk.Entry(search_frame, bg=SED, fg=STEXT,
-                                  insertbackground=SACC, relief="flat",
-                                  font=("Consolas", 8))
+        tk.Label(search_frame, text="🔍", bg=SBG, fg=SMUTED, font=("Segoe UI", 8)).pack(
+            side="left", padx=(0, 4)
+        )
+        _search_entry = tk.Entry(
+            search_frame,
+            bg=SED,
+            fg=STEXT,
+            insertbackground=SACC,
+            relief="flat",
+            font=("Consolas", 8),
+        )
         _search_entry.pack(side="left", fill="x", expand=True)
-        tk.Label(search_frame, text="ESC to clear", bg=SBG, fg=SMUTED,
-                 font=("Segoe UI", 6)).pack(side="left", padx=(4, 0))
-        _search_entry.bind("<KeyRelease>", lambda _: (
-            _filter_text.__setitem__(0, _search_entry.get().strip().lower()),
-            _refresh_list()
-        ))
-        ed.bind("<Escape>", lambda _: (
-            _search_entry.delete(0, "end"),
-            _filter_text.__setitem__(0, ""),
-            _refresh_list()
-        ))
+        tk.Label(
+            search_frame, text="ESC to clear", bg=SBG, fg=SMUTED, font=("Segoe UI", 6)
+        ).pack(side="left", padx=(4, 0))
+        _search_entry.bind(
+            "<KeyRelease>",
+            lambda _: (
+                _filter_text.__setitem__(0, _search_entry.get().strip().lower()),
+                _refresh_list(),
+            ),
+        )
+        ed.bind(
+            "<Escape>",
+            lambda _: (
+                _search_entry.delete(0, "end"),
+                _filter_text.__setitem__(0, ""),
+                _refresh_list(),
+            ),
+        )
 
         list_frame = tk.Frame(body, bg=SBG)
         list_frame.pack(side="left", fill="both", expand=True)
 
         class VirtualEventList:
             """Canvas-based virtual list — O(visible) not O(total)."""
+
             ROW_H = 24
 
             def __init__(self, parent):
                 self.outer = tk.Frame(parent, bg=SBG, width=380, height=350)
                 self.outer.pack_propagate(False)
                 self.outer.pack(side="left", fill="both", expand=True)
-                self._sb = tk.Scrollbar(self.outer, orient="vertical",
-                    bg=SSURF, troughcolor=SBG, activebackground=SACC,
-                    relief="flat", bd=0)
+                self._sb = tk.Scrollbar(
+                    self.outer,
+                    orient="vertical",
+                    bg=SSURF,
+                    troughcolor=SBG,
+                    activebackground=SACC,
+                    relief="flat",
+                    bd=0,
+                )
                 self._sb.pack(side="right", fill="y")
-                self._cv = tk.Canvas(self.outer, bg=SBG, highlightthickness=0, bd=0,
-                    yscrollcommand=self._update_scrollbar)
+                self._cv = tk.Canvas(
+                    self.outer,
+                    bg=SBG,
+                    highlightthickness=0,
+                    bd=0,
+                    yscrollcommand=self._update_scrollbar,
+                )
                 self._cv.pack(side="left", fill="both", expand=True)
                 self._sb.config(command=self._on_sb)
                 self.selected_indices = set()
                 self.on_select_cb = None
                 self._on_reorder_cb = None
-                self._items = []        # [(display_text, ev_dict), ...]
+                self._items = []  # [(display_text, ev_dict), ...]
                 self._top_idx = 0
                 self._hovered_idx = -1
                 self._drag_idx = None
                 self._drag_y = 0.0
                 self._width = 380
                 self._height = 350
-                self._empty_lbl = tk.Label(self._cv,
+                self._empty_lbl = tk.Label(
+                    self._cv,
                     text="No events.\nUse Quick Add to create one.",
-                    bg=SBG, fg=SMUTED, font=("Segoe UI", 9),
-                    justify="center", anchor="center")
-                self._empty_win = self._cv.create_window(190, 120,
-                    window=self._empty_lbl, anchor="center")
+                    bg=SBG,
+                    fg=SMUTED,
+                    font=("Segoe UI", 9),
+                    justify="center",
+                    anchor="center",
+                )
+                self._empty_win = self._cv.create_window(
+                    190, 120, window=self._empty_lbl, anchor="center"
+                )
                 self._cv.bind("<Configure>", self._on_configure)
                 self._cv.bind("<Button-1>", self._on_click)
                 self._cv.bind("<B1-Motion>", self._on_b1_motion)
@@ -3996,125 +4356,238 @@ h1{{font-size:30px}}
                 self._cv.bind("<MouseWheel>", self._on_mousewheel)
                 self._cv.bind("<Button-4>", self._on_mousewheel)
                 self._cv.bind("<Button-5>", self._on_mousewheel)
-                self.outer.bind("<Enter>", lambda _: self._cv.bind_all("<MouseWheel>", self._on_mousewheel))
-                self.outer.bind("<Leave>", lambda _: self._cv.unbind_all("<MouseWheel>"))
+                self.outer.bind(
+                    "<Enter>",
+                    lambda _: self._cv.bind_all("<MouseWheel>", self._on_mousewheel),
+                )
+                self.outer.bind(
+                    "<Leave>", lambda _: self._cv.unbind_all("<MouseWheel>")
+                )
 
             def _update_scrollbar(self, *_):
                 total = len(self._items)
-                if total == 0: self._sb.set(0.0, 1.0); return
+                if total == 0:
+                    self._sb.set(0.0, 1.0)
+                    return
                 vis = self._vis_count()
                 lo = self._top_idx / total
                 self._sb.set(lo, min(1.0, (self._top_idx + vis) / total))
+
             def _on_sb(self, action, value, unit=None):
-                total = len(self._items); vis = self._vis_count()
-                if action == "moveto": self._top_idx = int(float(value) * total)
-                elif action == "scroll": self._top_idx += int(value) * (vis - 1 if unit == "pages" else 1)
-                self._clamp_top(); self._redraw()
+                total = len(self._items)
+                vis = self._vis_count()
+                if action == "moveto":
+                    self._top_idx = int(float(value) * total)
+                elif action == "scroll":
+                    self._top_idx += int(value) * (vis - 1 if unit == "pages" else 1)
+                self._clamp_top()
+                self._redraw()
+
             def _on_mousewheel(self, e):
-                if hasattr(e, "num") and e.num == 4: delta = -3
-                elif hasattr(e, "num") and e.num == 5: delta = 3
-                elif hasattr(e, "delta") and e.delta: delta = int(-1 * (e.delta / 120)) * 3
-                else: delta = 0
-                self._top_idx += delta; self._clamp_top(); self._redraw()
-            def _vis_count(self): return max(1, self._height // self.ROW_H + 1)
+                if hasattr(e, "num") and e.num == 4:
+                    delta = -3
+                elif hasattr(e, "num") and e.num == 5:
+                    delta = 3
+                elif hasattr(e, "delta") and e.delta:
+                    delta = int(-1 * (e.delta / 120)) * 3
+                else:
+                    delta = 0
+                self._top_idx += delta
+                self._clamp_top()
+                self._redraw()
+
+            def _vis_count(self):
+                return max(1, self._height // self.ROW_H + 1)
+
             def _clamp_top(self):
-                self._top_idx = max(0, min(self._top_idx, max(0, len(self._items) - self._vis_count())))
-            def _y_to_idx(self, y): return self._top_idx + int(y // self.ROW_H)
+                self._top_idx = max(
+                    0, min(self._top_idx, max(0, len(self._items) - self._vis_count()))
+                )
+
+            def _y_to_idx(self, y):
+                return self._top_idx + int(y // self.ROW_H)
+
             def _on_configure(self, e):
-                self._width = e.width; self._height = e.height
-                self._cv.coords(self._empty_win, e.width // 2, e.height // 2); self._redraw()
+                self._width = e.width
+                self._height = e.height
+                self._cv.coords(self._empty_win, e.width // 2, e.height // 2)
+                self._redraw()
 
             def _redraw(self):
                 self._cv.delete("vrow")
                 total = len(self._items)
-                if total == 0: self._cv.itemconfigure(self._empty_win, state="normal"); self._update_scrollbar(); return
+                if total == 0:
+                    self._cv.itemconfigure(self._empty_win, state="normal")
+                    self._update_scrollbar()
+                    return
                 self._cv.itemconfigure(self._empty_win, state="hidden")
-                self._clamp_top(); w = self._width
+                self._clamp_top()
+                w = self._width
                 for slot in range(self._vis_count()):
                     idx = self._top_idx + slot
-                    if idx >= total: break
+                    if idx >= total:
+                        break
                     text, _ = self._items[idx]
-                    y0 = slot * self.ROW_H; y1 = y0 + self.ROW_H - 1
+                    y0 = slot * self.ROW_H
+                    y1 = y0 + self.ROW_H - 1
                     is_sel = idx in self.selected_indices
                     is_hov = idx == self._hovered_idx
-                    bg, fg, pf = (SACC, SBG, SBG) if is_sel else (SED, STEXT, SACC) if is_hov else (SSURF, STEXT, SSURF)
-                    self._cv.create_rectangle(0, y0, w, y1, fill=bg, outline="", tags="vrow")
-                    self._cv.create_text(8, y0 + self.ROW_H // 2, text=text, anchor="w",
-                        fill=fg, font=("Consolas", 8), width=max(w - 46, 40), tags="vrow")
-                    self._cv.create_text(w - 8, y0 + self.ROW_H // 2, text="✏", anchor="e",
-                        fill=pf, font=("Segoe UI", 9), tags="vrow")
+                    bg, fg, pf = (
+                        (SACC, SBG, SBG)
+                        if is_sel
+                        else (SED, STEXT, SACC)
+                        if is_hov
+                        else (SSURF, STEXT, SSURF)
+                    )
+                    self._cv.create_rectangle(
+                        0, y0, w, y1, fill=bg, outline="", tags="vrow"
+                    )
+                    self._cv.create_text(
+                        8,
+                        y0 + self.ROW_H // 2,
+                        text=text,
+                        anchor="w",
+                        fill=fg,
+                        font=("Consolas", 8),
+                        width=max(w - 46, 40),
+                        tags="vrow",
+                    )
+                    self._cv.create_text(
+                        w - 8,
+                        y0 + self.ROW_H // 2,
+                        text="✏",
+                        anchor="e",
+                        fill=pf,
+                        font=("Segoe UI", 9),
+                        tags="vrow",
+                    )
                 self._update_scrollbar()
 
             def _on_motion(self, e):
                 idx = self._y_to_idx(e.y)
-                if idx != self._hovered_idx: self._hovered_idx = idx; self._redraw()
+                if idx != self._hovered_idx:
+                    self._hovered_idx = idx
+                    self._redraw()
+
             def _on_leave(self, e):
-                if self._hovered_idx != -1: self._hovered_idx = -1; self._redraw()
+                if self._hovered_idx != -1:
+                    self._hovered_idx = -1
+                    self._redraw()
+
             def _on_click(self, e):
                 idx = self._y_to_idx(e.y)
-                if not (0 <= idx < len(self._items)): return
-                if e.x >= self._width - 30: self._do_pen_click(idx, self._items[idx][1]); return
+                if not (0 <= idx < len(self._items)):
+                    return
+                if e.x >= self._width - 30:
+                    self._do_pen_click(idx, self._items[idx][1])
+                    return
                 ctrl = bool(e.state & 0x0004)
-                if ctrl: 
-                    self.select_toggle(idx); self._drag_idx = idx; self._drag_y = float(e.y_root)
+                if ctrl:
+                    self.select_toggle(idx)
+                    self._drag_idx = idx
+                    self._drag_y = float(e.y_root)
                     # S-11 fix: save undo state ONCE at drag start, not on every swap
                     save_state()
-                else: self.selection_set(idx)
-                if self.on_select_cb: self.on_select_cb()
+                else:
+                    self.selection_set(idx)
+                if self.on_select_cb:
+                    self.on_select_cb()
+
             def _on_b1_motion(self, e):
-                if self._drag_idx is None: return
+                if self._drag_idx is None:
+                    return
                 dy = e.y_root - self._drag_y
-                if abs(dy) < self.ROW_H: return
+                if abs(dy) < self.ROW_H:
+                    return
                 self._drag_y = float(e.y_root)
                 direction = 1 if dy > 0 else -1
                 new_idx = self._drag_idx + direction
                 if 0 <= new_idx < len(self._items) and self._on_reorder_cb:
-                    self._on_reorder_cb(self._drag_idx, new_idx); self._drag_idx = new_idx
-            def _on_b1_release(self, e): self._drag_idx = None
+                    self._on_reorder_cb(self._drag_idx, new_idx)
+                    self._drag_idx = new_idx
+
+            def _on_b1_release(self, e):
+                self._drag_idx = None
 
             def _do_pen_click(self, idx, ev):
                 # S-10 fix: guard against playback starting while modal is open
-                if self._master._app_busy() if hasattr(self._master, "_app_busy") else (self._master.playing or self._master.looping):
+                if (
+                    self._master._app_busy()
+                    if hasattr(self._master, "_app_busy")
+                    else (self._master.playing or self._master.looping)
+                ):
                     return
                 from tkinter import simpledialog
+
                 top = self.outer.winfo_toplevel()
                 try:
                     top.grab_set()
                 except Exception:
                     pass
                 try:
-                    ans = simpledialog.askstring("Rename Action",
+                    ans = simpledialog.askstring(
+                        "Rename Action",
                         "Enter visual name/comment for this action:",
                         initialvalue=ev.get("custom_name", ""),
-                        parent=top)
+                        parent=top,
+                    )
                 finally:
                     try:
                         top.grab_release()
                     except Exception:
                         pass
-                if ans is not None: save_state(); ev["custom_name"] = ans.strip(); _refresh_list()
+                if ans is not None:
+                    save_state()
+                    ev["custom_name"] = ans.strip()
+                    _refresh_list()
 
-            def curselection(self): return tuple(sorted(self.selected_indices))
-            def selection_clear(self, start=0, end="end"): self.selected_indices.clear(); self._redraw()
-            def selection_set(self, idx): self.selected_indices.clear(); self.selected_indices.add(idx); self._redraw()
-            def select_toggle(self, idx):
-                if idx in self.selected_indices: self.selected_indices.remove(idx)
-                else: self.selected_indices.add(idx)
+            def curselection(self):
+                return tuple(sorted(self.selected_indices))
+
+            def selection_clear(self, start=0, end="end"):
+                self.selected_indices.clear()
                 self._redraw()
+
+            def selection_set(self, idx):
+                self.selected_indices.clear()
+                self.selected_indices.add(idx)
+                self._redraw()
+
+            def select_toggle(self, idx):
+                if idx in self.selected_indices:
+                    self.selected_indices.remove(idx)
+                else:
+                    self.selected_indices.add(idx)
+                self._redraw()
+
             def see(self, idx):
                 vis = self._vis_count()
-                if idx < self._top_idx: self._top_idx = max(0, idx - 1)
-                elif idx >= self._top_idx + vis - 2: self._top_idx = max(0, idx - vis + 3)
+                if idx < self._top_idx:
+                    self._top_idx = max(0, idx - 1)
+                elif idx >= self._top_idx + vis - 2:
+                    self._top_idx = max(0, idx - vis + 3)
                 self._redraw()
+
             def delete(self, start, end=None):
                 self._items.clear()
-                if start == 0 and end == "end": self.selected_indices.clear()
-                self._top_idx = 0; self._hovered_idx = -1; self._redraw()
-            def insert(self, _end, text, _i, ev): self._items.append((text, ev))
-            def finalize(self): self._top_idx = 0; self._redraw()
+                if start == 0 and end == "end":
+                    self.selected_indices.clear()
+                self._top_idx = 0
+                self._hovered_idx = -1
+                self._redraw()
+
+            def insert(self, _end, text, _i, ev):
+                self._items.append((text, ev))
+
+            def finalize(self):
+                self._top_idx = 0
+                self._redraw()
+
             def bind(self, event, callback):
-                if event == "<<ListboxSelect>>": self.on_select_cb = callback
-                else: self._cv.bind(event, callback)
+                if event == "<<ListboxSelect>>":
+                    self.on_select_cb = callback
+                else:
+                    self._cv.bind(event, callback)
 
         lb = VirtualEventList(list_frame)
 
@@ -4122,12 +4595,20 @@ h1{{font-size:30px}}
         # S-11 fix: save_state() is called once at drag start, not on every swap
         def _on_reorder(src_idx, dst_idx):
             indices = _filter_indices[0]
-            real_src = indices[src_idx] if indices and src_idx < len(indices) else src_idx
-            real_dst = indices[dst_idx] if indices and dst_idx < len(indices) else dst_idx
+            real_src = (
+                indices[src_idx] if indices and src_idx < len(indices) else src_idx
+            )
+            real_dst = (
+                indices[dst_idx] if indices and dst_idx < len(indices) else dst_idx
+            )
             with self._ev_lock:
-                if 0 <= real_src < len(self.events) and 0 <= real_dst < len(self.events):
-                    self.events[real_src], self.events[real_dst] = \
-                        self.events[real_dst], self.events[real_src]
+                if 0 <= real_src < len(self.events) and 0 <= real_dst < len(
+                    self.events
+                ):
+                    self.events[real_src], self.events[real_dst] = (
+                        self.events[real_dst],
+                        self.events[real_src],
+                    )
             _refresh_list(select=dst_idx)
 
         lb._on_reorder_cb = _on_reorder
@@ -4214,6 +4695,7 @@ h1{{font-size:30px}}
             elif key == "btn":
                 # Button field: clickable label that toggles left/right
                 btn_row_ref[0] = row
+
                 def _toggle_btn_val(_=None):
                     curr = btn_toggle_var.get()
                     nxt = "right" if curr == "left" else "left"
@@ -4229,7 +4711,7 @@ h1{{font-size:30px}}
                     cursor="hand2",
                     padx=6,
                     pady=2,
-                    relief="flat"
+                    relief="flat",
                 )
                 ent.bind("<Button-1>", _toggle_btn_val)
             elif key in ("x", "y"):
@@ -4255,29 +4737,40 @@ h1{{font-size:30px}}
                         font=("Segoe UI", 7, "bold"),
                         cursor="hand2",
                         padx=4,
-                        relief="flat"
+                        relief="flat",
                     )
                     sel_btn.pack(side="right", padx=(4, 0))
 
                     def _start_coord_picker():
-                        hint_lbl.config(text="Move mouse and RIGHT-CLICK to select coordinates...", fg=SREC)
+                        hint_lbl.config(
+                            text="Move mouse and RIGHT-CLICK to select coordinates...",
+                            fg=SREC,
+                        )
                         sel_btn.config(bg=SREC, text="...")
-                        
+
                         listener_ref = [None]
-                        
+
                         # Floating tooltip window to display coordinate tracker next to cursor
                         tooltip = tk.Toplevel(ed)
                         tooltip.overrideredirect(True)
                         tooltip.attributes("-topmost", True)
                         tooltip.configure(bg="#1a1a1a")
-                        tt_lbl = tk.Label(tooltip, text="0, 0", bg="#1a1a1a", fg="#ffffff", font=("Segoe UI", 8, "bold"), padx=4, pady=2)
+                        tt_lbl = tk.Label(
+                            tooltip,
+                            text="0, 0",
+                            bg="#1a1a1a",
+                            fg="#ffffff",
+                            font=("Segoe UI", 8, "bold"),
+                            padx=4,
+                            pady=2,
+                        )
                         tt_lbl.pack()
-                        
+
                         def _on_move_picked(x, y):
                             # Position tooltip window slightly offset from the cursor
                             tooltip.geometry(f"+{int(x) + 15}+{int(y) + 15}")
                             tt_lbl.config(text=f"{int(x)}, {int(y)}")
-                        
+
                         def _on_click_picked(x, y, button, pressed):
                             if not pressed and button == _pmouse.Button.right:
                                 # Stop listener
@@ -4297,7 +4790,9 @@ h1{{font-size:30px}}
                             # Apply automatically
                             _apply()
 
-                        listener_ref[0] = _pmouse.Listener(on_move=_on_move_picked, on_click=_on_click_picked)
+                        listener_ref[0] = _pmouse.Listener(
+                            on_move=_on_move_picked, on_click=_on_click_picked
+                        )
                         listener_ref[0].start()
 
                     sel_btn.bind("<Button-1>", lambda _: _start_coord_picker())
@@ -4315,8 +4810,6 @@ h1{{font-size:30px}}
             if key != "x" and key != "y":
                 ent.pack(side="left", fill="x", expand=True)
             field_vars[key] = (var, row, lbl_w)
-
-
 
         # Image Source Selector for 'I' events (Current Imgs vs Folder)
         custom_folder_path = [""]
@@ -4386,7 +4879,7 @@ h1{{font-size:30px}}
                 btn_change_fold.config(bg=SBORD, fg=SMUTED)
                 img_names = []
                 for _item in self.image_det_list:
-                    _n = _item.get("name") or Path(_item.get("path", "")).get("stem", "") if hasattr(Path(_item.get("path", "")), "get") else Path(_item.get("path", "")).stem
+                    _n = _item.get("name") or Path(_item.get("path", "")).stem
                     if _n:
                         img_names.append(_n)
                 if _name_combo[0] is not None:
@@ -4408,7 +4901,13 @@ h1{{font-size:30px}}
                     fpath = Path(custom_folder_path[0])
                     if fpath.exists():
                         for p in fpath.glob("*"):
-                            if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+                            if p.is_file() and p.suffix.lower() in (
+                                ".png",
+                                ".jpg",
+                                ".jpeg",
+                                ".bmp",
+                                ".webp",
+                            ):
                                 img_files.append(p.name)
                 except Exception:
                     pass
@@ -4460,20 +4959,30 @@ h1{{font-size:30px}}
             if t == "M":
                 return f"{i + 1:04d}  {d:>5}ms  {custom_lbl}Move  x={ev.get('x', 0)} y={ev.get('y', 0)}"
             elif t == "C":
-                btn = ev.get('btn', 'left')
+                btn = ev.get("btn", "left")
                 prefix = "Hold Click" if d > 0 else "Click"
-                dur_str = f" ({d}ms)" if d > 0 else " (Down)" if not ev.get("up", False) else " (Up)"
+                dur_str = (
+                    f" ({d}ms)"
+                    if d > 0
+                    else " (Down)"
+                    if not ev.get("up", False)
+                    else " (Up)"
+                )
                 return f"{i + 1:04d}  {custom_lbl}{prefix} {btn}{dur_str}  x={ev.get('x', 0)} y={ev.get('y', 0)}"
             elif t == "K":
                 name = _vk_to_name(ev.get("vk", 0))
                 prefix = "Hold Key" if d > 0 else "Key"
-                dur_str = f" ({d}ms)" if d > 0 else " (Down)" if not ev.get("up", False) else " (Up)"
+                dur_str = (
+                    f" ({d}ms)"
+                    if d > 0
+                    else " (Down)"
+                    if not ev.get("up", False)
+                    else " (Up)"
+                )
                 return f"{i + 1:04d}  {custom_lbl}{prefix} {name}{dur_str}"
             elif t in ("W", "WH"):
                 axis = "H" if t == "WH" else "V"
-                return (
-                    f"{i + 1:04d}  {d:>5}ms  {custom_lbl}Scroll {axis} delta={ev.get('delta', 0)}"
-                )
+                return f"{i + 1:04d}  {d:>5}ms  {custom_lbl}Scroll {axis} delta={ev.get('delta', 0)}"
             elif t == "I":
                 return f"{i + 1:04d}  {custom_lbl}Image {ev.get('name') or ev.get('img', '?')}"
             elif t == "B":
@@ -4494,14 +5003,20 @@ h1{{font-size:30px}}
                 snap = list(self.events)
             ft = _filter_text[0]
             if ft:
-                filtered = [(i, ev) for i, ev in enumerate(snap) if ft in _format_line(i, ev).lower()]
+                filtered = [
+                    (i, ev)
+                    for i, ev in enumerate(snap)
+                    if ft in _format_line(i, ev).lower()
+                ]
                 snap_indices = [p[0] for p in filtered]
                 snap = [p[1] for p in filtered]
             else:
                 snap_indices = list(range(len(snap)))
             _filter_indices[0] = snap_indices  # expose for drag-reorder callback
             total = len(snap)
-            cnt_lbl.config(text=f"{total} events" + (f'  (filter: "{ft}")' if ft else ""))
+            cnt_lbl.config(
+                text=f"{total} events" + (f'  (filter: "{ft}")' if ft else "")
+            )
             for j, ev in enumerate(snap):
                 lb.insert("end", _format_line(snap_indices[j], ev), j, ev)
             lb.finalize()
@@ -4599,7 +5114,9 @@ h1{{font-size:30px}}
                 field_vars["name"][1].pack(fill="x", pady=2)
                 # Load action into the Combobox; default to "image" if stored value not in list
                 stored_action = ev.get("action", "image")
-                field_vars["action"][0].set(stored_action if stored_action in ("image", "run") else "image")
+                field_vars["action"][0].set(
+                    stored_action if stored_action in ("click", "none") else "click"
+                )
                 field_vars["action"][1].pack(fill="x", pady=2)
             if t == "B":
                 field_vars["name"][0].set(ev.get("name") or ev.get("img", ""))
@@ -4650,11 +5167,15 @@ h1{{font-size:30px}}
                 foot.pack_forget()
                 panel.config(width=170)
             else:
-                edit_title_lbl.pack(fill="x", padx=8, pady=(8, 4), before=quick_add_frame)
+                edit_title_lbl.pack(
+                    fill="x", padx=8, pady=(8, 4), before=quick_add_frame
+                )
                 hint_lbl.pack(fill="x", padx=8, pady=(0, 6), before=quick_add_frame)
                 fields_frame.pack(fill="x", padx=8, before=quick_add_frame)
                 if "top_btn_frame" in globals() or "top_btn_frame" in locals():
-                    top_btn_frame.pack(fill="x", padx=8, pady=(10, 4), before=quick_add_frame)
+                    top_btn_frame.pack(
+                        fill="x", padx=8, pady=(10, 4), before=quick_add_frame
+                    )
                 foot.pack(side="bottom", fill="x", padx=8, pady=8)
                 panel.config(width=200)
 
@@ -4732,18 +5253,25 @@ h1{{font-size:30px}}
                         if name:
                             ev["name"] = name
                             ev["img"] = name
-                            if img_source_var.get() == "folder" and custom_folder_path[0]:
+                            if (
+                                img_source_var.get() == "folder"
+                                and custom_folder_path[0]
+                            ):
                                 src_file = Path(custom_folder_path[0]) / name
                                 if src_file.is_file():
                                     try:
                                         import shutil
+
                                         IMAGES_PATH.mkdir(parents=True, exist_ok=True)
                                         shutil.copy2(src_file, IMAGES_PATH / name)
+                                        get_cached_template.cache_clear()
                                     except Exception as e:
-                                        _LOG.error("Failed to copy image to IMAGES_PATH: %s", e)
+                                        _LOG.error(
+                                            "Failed to copy image to IMAGES_PATH: %s", e
+                                        )
                         # Read action type from the readonly Combobox dropdown
                         action = field_vars["action"][0].get().strip().lower()
-                        if action in ("image", "run"):
+                        if action in ("click", "none", "image", "run"):
                             ev["action"] = action
                     if t == "B":
                         name = field_vars["name"][0].get().strip()
@@ -4777,7 +5305,7 @@ h1{{font-size:30px}}
             if tk.messagebox.askyesno(
                 "Delete All",
                 "Are you sure you want to delete all actions from this macro?\n\n(Tip: Press Ctrl + Z in the editor to Undo if needed.)",
-                parent=ed
+                parent=ed,
             ):
                 save_state()
                 with self._ev_lock:
@@ -4846,7 +5374,9 @@ h1{{font-size:30px}}
                     {
                         "t": "K",
                         "vk": 0x44 if sys.platform == "win32" else "d",
-                        "scan": user32.MapVirtualKeyW(0x44, 0) if sys.platform == "win32" else 0,
+                        "scan": user32.MapVirtualKeyW(0x44, 0)
+                        if sys.platform == "win32"
+                        else 0,
                         "ext": False,
                         "up": False,
                         "d": 100,  # 100ms key hold duration
@@ -4861,9 +5391,7 @@ h1{{font-size:30px}}
             save_state()
             with self._ev_lock:
                 pos = len(self.events)
-                self.events.append(
-                    {"t": "W", "x": x, "y": y, "delta": 120, "d": 50}
-                )
+                self.events.append({"t": "W", "x": x, "y": y, "delta": 120, "d": 50})
             _refresh_list(select=pos)
 
         def _add_wait():
@@ -4923,9 +5451,7 @@ h1{{font-size:30px}}
             save_state()
             with self._ev_lock:
                 pos = len(self.events)
-                self.events.append(
-                    {"t": "B", "name": name, "img": name, "skip": 1}
-                )
+                self.events.append({"t": "B", "name": name, "img": name, "skip": 1})
             _refresh_list(select=pos)
 
         def _make_btn(parent, text, cmd, bg=SBORD, fg=SMUTED, bold=False):
@@ -4956,7 +5482,7 @@ h1{{font-size:30px}}
         _make_btn(row1, "▲", _move_up).pack(side="left", padx=(0, 2))
         _make_btn(row1, "▼", _move_down).pack(side="left", padx=(0, 2))
         _make_btn(row1, "Dup", _duplicate).pack(side="left", padx=(0, 2))
-        
+
         # Hold Checkbutton placed beautifully in the empty space
         hold_chk = tk.Checkbutton(
             row1,
@@ -4969,7 +5495,7 @@ h1{{font-size:30px}}
             activeforeground=STEXT,
             font=("Segoe UI", 7),
             cursor="hand2",
-            command=_toggle_hold_display
+            command=_toggle_hold_display,
         )
         hold_chk.pack(side="left", padx=(6, 0))
         hold_chk_ref[0] = hold_chk
@@ -4985,7 +5511,11 @@ h1{{font-size:30px}}
         quick_add_frame.pack(fill="x", padx=8, pady=(10, 4))
 
         tk.Label(
-            quick_add_frame, text="Quick Add:", bg=SSURF, fg=SMUTED, font=("Segoe UI", 7)
+            quick_add_frame,
+            text="Quick Add:",
+            bg=SSURF,
+            fg=SMUTED,
+            font=("Segoe UI", 7),
         ).pack(fill="x", pady=(8, 2), anchor="w")
         row2 = tk.Frame(quick_add_frame, bg=SSURF)
         row2.pack(fill="x", pady=2)
@@ -5117,7 +5647,7 @@ h1{{font-size:30px}}
         try:
             if t == "M":
                 cx, cy = int(ev["x"]), int(ev["y"])
-                
+
                 # Check if cursor is locked/centered in the active window (camera mode)
                 is_cursor_locked = False
                 try:
@@ -5131,10 +5661,17 @@ h1{{font-size:30px}}
                             if user32.ClientToScreen(hwnd, _ct.byref(pt_center)):
                                 pt_curr = POINT()
                                 if user32.GetCursorPos(_ct.byref(pt_curr)):
-                                    if abs(pt_curr.x - pt_center.x) <= 2 and abs(pt_curr.y - pt_center.y) <= 2:
+                                    if (
+                                        abs(pt_curr.x - pt_center.x) <= 2
+                                        and abs(pt_curr.y - pt_center.y) <= 2
+                                    ):
                                         is_cursor_locked = True
                 except Exception:
                     pass
+
+                # Bug 17: Skip absolute repositioning when cursor is locked/centered (camera mode)
+                if is_cursor_locked:
+                    return
 
                 # ALWAYS use relative movement — never teleport with SetCursorPos
                 pt = POINT()
@@ -5152,7 +5689,7 @@ h1{{font-size:30px}}
             elif t == "C":
                 btn_name = ev.get("btn", "left")
                 cx, cy = int(ev.get("x", 0)), int(ev.get("y", 0))
-                
+
                 # ALWAYS use relative movement — never teleport with SetCursorPos
                 pt = POINT()
                 try:
@@ -5166,7 +5703,7 @@ h1{{font-size:30px}}
 
                 if dx != 0 or dy != 0:
                     _send_input(_mouse_move_rel(dx, dy))
-                
+
                 if "up" in ev:
                     up = ev.get("up", False)
                     _send_input(_mouse_button(btn_name, up))
@@ -5191,7 +5728,7 @@ h1{{font-size:30px}}
                 )
                 if vk and not scan:
                     scan = user32.MapVirtualKeyW(vk, 0)
-                
+
                 if "up" in ev:
                     _send_input(_make_key(vk, scan, up, ext))
                     with self._held_lock:
@@ -5201,7 +5738,7 @@ h1{{font-size:30px}}
                                 "press_time": time.perf_counter(),
                                 "last_reinject": time.perf_counter(),
                                 "scan": scan,
-                                "ext": ext
+                                "ext": ext,
                             }
                         else:
                             self._held_vks.discard(vk)
@@ -5231,6 +5768,20 @@ h1{{font-size:30px}}
                 _send_input(_mouse_wheel(cx, cy, ev.get("delta", 0), h=True))
             elif t == "D":
                 pass
+            elif t == "B":
+                # Branch/if-image — treat as found (continue) in fallback replay
+                pass
+            elif t == "R":
+                # Bug 16: Run sub-macro event for Python fallback playback
+                name = ev.get("name", "")
+                rp = self._resolve_run_path(name)
+                if rp:
+                    try:
+                        with open(rp, encoding="utf-8") as f:
+                            sub_evs = [e for e in json.load(f) if _valid_ev(e)]
+                        self._replay_inline_events(sub_evs, depth + 1)
+                    except Exception as e:
+                        _LOG.warning("Run step failed: %s", e)
             elif t == "I":
                 # Image search event
                 img_name = ev.get("name") or ev.get("img", "")
@@ -5287,10 +5838,11 @@ h1{{font-size:30px}}
                                     dx2, dy2 = tx - pt2.x, ty - pt2.y
                                     if dx2 != 0 or dy2 != 0:
                                         _send_input(_mouse_move_rel(dx2, dy2))
-                                    _send_input(_mouse_move(tx, ty))
                                     time.sleep(0.2)
                         except Exception as e_inner:
-                            _LOG.warning("Image Search Event Match failure: %s", e_inner)
+                            _LOG.warning(
+                                "Image Search Event Match failure: %s", e_inner
+                            )
         except Exception as e:
             _LOG.debug("Replay: %s – %r", e, ev)
 
@@ -5343,7 +5895,11 @@ h1{{font-size:30px}}
         dialog.grab_set()
 
         tk.Label(
-            dialog, text="Enter Run Name:", bg=SBG, fg=STEXT, font=("Segoe UI", 9, "bold")
+            dialog,
+            text="Enter Run Name:",
+            bg=SBG,
+            fg=STEXT,
+            font=("Segoe UI", 9, "bold"),
         ).pack(pady=(12, 6))
 
         ent_var = tk.StringVar()
@@ -5367,17 +5923,19 @@ h1{{font-size:30px}}
                     name = name[:-4]
                 elif name.endswith(".json"):
                     name = name[:-5]
-                
+
                 RUNS_PATH.mkdir(parents=True, exist_ok=True)
                 path = RUNS_PATH / f"{name}.txt"
-                
+
                 try:
                     with self._ev_lock:
                         snap = _clean_events_for_save(self.events)
                     with open(path, "w", encoding="utf-8") as f:
                         json.dump(snap, f)
                     self.set_status("💾 Saved Run", _C["go"], 1500)
-                    threading.Thread(target=self._webhook, args=("save",), daemon=True).start()
+                    threading.Thread(
+                        target=self._webhook, args=("save",), daemon=True
+                    ).start()
                 except Exception as e:
                     _LOG.error("Save: %s", e)
                     self.set_status("ERR save", _C["rec"], 2000)
@@ -5387,12 +5945,26 @@ h1{{font-size:30px}}
         btn_frame.pack(pady=8)
 
         ok_f = tk.Frame(btn_frame, bg=SACC_D, cursor="hand2")
-        ok_l = tk.Label(ok_f, text="Save", bg=SACC_D, fg=STEXT, font=("Segoe UI", 8, "bold"), cursor="hand2")
+        ok_l = tk.Label(
+            ok_f,
+            text="Save",
+            bg=SACC_D,
+            fg=STEXT,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+        )
         ok_l.pack(padx=12, pady=3)
         ok_f.pack(side="left", padx=4)
 
         cancel_f = tk.Frame(btn_frame, bg=SBORD, cursor="hand2")
-        cancel_l = tk.Label(cancel_f, text="Cancel", bg=SBORD, fg=SMUTED, font=("Segoe UI", 8), cursor="hand2")
+        cancel_l = tk.Label(
+            cancel_f,
+            text="Cancel",
+            bg=SBORD,
+            fg=SMUTED,
+            font=("Segoe UI", 8),
+            cursor="hand2",
+        )
         cancel_l.pack(padx=12, pady=3)
         cancel_f.pack(side="left", padx=4)
 
@@ -5406,8 +5978,13 @@ h1{{font-size:30px}}
                 data = json.load(f)
             if isinstance(data, list):
                 self.events = [ev for ev in data if _valid_ev(ev)]
+        except FileNotFoundError:
+            self.set_status("Run file not found!", _C["rec"], 3000)
+            self.cfg.save_path = ""
+            self.cfg.save()
         except Exception as e:
             _LOG.error("Load: %s", e)
+            self.set_status("Load failed!", _C["rec"], 3000)
 
     def _auto_save_run(self):
         if not self.events:
@@ -5423,6 +6000,18 @@ h1{{font-size:30px}}
             self.cfg.save_path = str(path)
             self.cfg.save()
             self.set_status("\U0001f4be Saved", _C["go"], 2500)
+            # Bug 11: Cap auto-saves to the last 50 files
+            try:
+                all_runs = sorted(
+                    RUNS_PATH.glob("run_*.txt"), key=lambda p: p.stat().st_mtime
+                )
+                for old in all_runs[:-50]:
+                    try:
+                        old.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception as e:
             _LOG.error("Auto-save run: %s", e)
             self.set_status("\u2717 Save err", _C["rec"], 2000)
@@ -5842,12 +6431,15 @@ h1{{font-size:30px}}
 
                 # ALWAYS check for disconnect during playback/loop (every 4s)
                 if active and getattr(self.cfg, "roblox_enabled", False):
-                    disc_interval = 2.0 if self._recovering else 4.0
+                    with self._recover_lock:
+                        disc_interval = 2.0 if self._recovering else 4.0
                     if now - last_disc_check >= disc_interval:
                         last_disc_check = now
                         try:
                             screen = _grab_screen(self._persistent_mss)
-                            import numpy as np, cv2
+                            import cv2
+                            import numpy as np
+
                             screen_np = np.array(screen)
                             del screen
                             screen_bgr = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
@@ -5882,7 +6474,7 @@ h1{{font-size:30px}}
         sh, sw = screen_bgr.shape[:2]
 
         # BUG-4 fix: per-image ROI dict so images don't clobber each other's cache
-        roi_cache = getattr(self, '_roi_cache', {})
+        roi_cache = getattr(self, "_roi_cache", {})
         if use_roi and roi_key and roi_key in roi_cache:
             rx, ry, rw, rh = roi_cache[roi_key]
             padding = 250
@@ -5894,7 +6486,9 @@ h1{{font-size:30px}}
             roi_h, roi_w = roi_area.shape[:2]
             if roi_w >= w and roi_h >= h:
                 try:
-                    res = cv2.matchTemplate(roi_area, template_bgr, cv2.TM_CCOEFF_NORMED)
+                    res = cv2.matchTemplate(
+                        roi_area, template_bgr, cv2.TM_CCOEFF_NORMED
+                    )
                     _, max_val, _, max_loc = cv2.minMaxLoc(res)
                     if max_val >= 0.55:
                         match_x = x1 + max_loc[0] + w // 2
@@ -6051,7 +6645,9 @@ h1{{font-size:30px}}
                                 best_val = best_val * 0.5
                             else:
                                 # Compare Hue difference (circular diff on 0-180 scale)
-                                hue_diff = min(abs(h_tpl - h_scr), 180 - abs(h_tpl - h_scr))
+                                hue_diff = min(
+                                    abs(h_tpl - h_scr), 180 - abs(h_tpl - h_scr)
+                                )
                                 if hue_diff > 25:
                                     # Hue mismatch (e.g. green vs red)
                                     best_val = best_val * 0.4
@@ -6066,7 +6662,12 @@ h1{{font-size:30px}}
             if best_val >= 0.55 and roi_key:
                 tw_full = int(w * best_scale)
                 th_full = int(h * best_scale)
-                roi_cache[roi_key] = (match_x - tw_full // 2, match_y - th_full // 2, tw_full, th_full)
+                roi_cache[roi_key] = (
+                    match_x - tw_full // 2,
+                    match_y - th_full // 2,
+                    tw_full,
+                    th_full,
+                )
 
             return best_val, (match_x, match_y)
 
@@ -6083,12 +6684,13 @@ h1{{font-size:30px}}
             return
 
         import cv2
+
         template = get_cached_template(img_path)
         if template is None:
             return
 
         max_val, match_pt = self._find_best_match(screen_bgr, template)
-        if max_val < 0.55:
+        if max_val < 0.75:
             return
 
         # ── Capture playback state BEFORE touching anything ──────────────
@@ -6102,8 +6704,12 @@ h1{{font-size:30px}}
             self._recovering = True
         try:
             _LOG.info("Disconnect detected (conf=%.2f) — auto-recovering...", max_val)
-            self.root.after(0, lambda: self.set_status(
-                "🔌 Disconnect — Rejoining...", _C["rec"], 5000))
+            self.root.after(
+                0,
+                lambda: self.set_status(
+                    "🔌 Disconnect — Rejoining...", _C["rec"], 5000
+                ),
+            )
 
             # S-7 fix: Terminate AHK BEFORE firing deeplink
             if self._ahk_proc is not None:
@@ -6114,8 +6720,19 @@ h1{{font-size:30px}}
                 self._ahk_proc = None
 
             # Emergency modifier release
-            for vk in (0x10, 0x11, 0x12, 0x5B, 0x5C,
-                       0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+            for vk in (
+                0x10,
+                0x11,
+                0x12,
+                0x5B,
+                0x5C,
+                0xA0,
+                0xA1,
+                0xA2,
+                0xA3,
+                0xA4,
+                0xA5,
+            ):
                 try:
                     sc = user32.MapVirtualKeyW(vk, 0)
                     _send_input(_make_key(vk, sc, True, vk in _EXTENDED_VKS))
@@ -6126,6 +6743,7 @@ h1{{font-size:30px}}
             link = getattr(self.cfg, "roblox_server_link", "").strip()
             if link:
                 import re
+
                 pm = re.search(r"/games/(\d+)", link)
                 if pm:
                     deeplink = "roblox://placeId=" + pm.group(1)
@@ -6135,7 +6753,9 @@ h1{{font-size:30px}}
                     try:
                         os.startfile(deeplink)
                     except Exception as ex:
-                        _LOG.error("os.startfile deeplink failed, trying webbrowser: %s", ex)
+                        _LOG.error(
+                            "os.startfile deeplink failed, trying webbrowser: %s", ex
+                        )
                         try:
                             webbrowser.open(deeplink)
                         except Exception as ex2:
@@ -6143,8 +6763,14 @@ h1{{font-size:30px}}
 
             # S-3 fix: interruptible sleep instead of blocking time.sleep()
             wait_t = float(getattr(self.cfg, "roblox_wait_time", 5.0))
-            self.root.after(0, lambda: self.set_status(
-                f"⏸ Waiting {wait_t:.0f}s for Roblox...", _C["loop"], int(wait_t * 1000)))
+            self.root.after(
+                0,
+                lambda: self.set_status(
+                    f"⏸ Waiting {wait_t:.0f}s for Roblox...",
+                    _C["loop"],
+                    int(wait_t * 1000),
+                ),
+            )
             _LOG.info("Waiting %.1fs for Roblox to load...", wait_t)
             for _ in range(int(wait_t * 10)):
                 if self._stop_ev.is_set():
@@ -6169,11 +6795,11 @@ h1{{font-size:30px}}
                         rec_evs = [ev for ev in rec_data if _valid_ev(ev)]
                         speed = max(0.1, min(10.0, self.cfg.speed))
                         rec_delays = [
-                            max(ev.get("d", 0), 0) / 1000.0 / speed
-                            for ev in rec_evs
+                            max(ev.get("d", 0), 0) / 1000.0 / speed for ev in rec_evs
                         ]
-                        self.root.after(0, lambda: self.set_status(
-                            "⚙️ Event Vol...", _C["go"], 3000))
+                        self.root.after(
+                            0, lambda: self.set_status("⚙️ Event Vol...", _C["go"], 3000)
+                        )
                         for delay, ev in zip(rec_delays, rec_evs):
                             if self._stop_ev.is_set():
                                 break
@@ -6193,8 +6819,9 @@ h1{{font-size:30px}}
             with self._click_lock:
                 self._clicked_this_run = set()
             _LOG.info("Restarting macro (loop=%s)...", was_looping)
-            self.root.after(0, lambda: self.set_status(
-                "✅ Recovery — Restarting", _C["go"], 3000))
+            self.root.after(
+                0, lambda: self.set_status("✅ Recovery — Restarting", _C["go"], 3000)
+            )
 
             self._stop_ev.clear()
             self.playing = True
@@ -6223,8 +6850,9 @@ h1{{font-size:30px}}
             raise
 
     def _check_images(self):
-        if getattr(self, "_recovering", False):
-            return
+        with self._recover_lock:
+            if self._recovering:
+                return
         try:
             import cv2
             import numpy as np
@@ -6233,7 +6861,7 @@ h1{{font-size:30px}}
             return
 
         try:
-            screen = _grab_screen()
+            screen = _grab_screen(getattr(self, "_persistent_mss", None))
             screen_np = np.array(screen)
             del screen
             screen_bgr = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
@@ -6261,7 +6889,9 @@ h1{{font-size:30px}}
             if template is None:
                 continue
 
-            max_val, match_pt = self._find_best_match(screen_bgr, template, roi_key=img_path)
+            max_val, match_pt = self._find_best_match(
+                screen_bgr, template, roi_key=img_path
+            )
             # S-4 fix: use per-image threshold if configured, else 0.55
             threshold = float(tgt.get("threshold", 0.55))
             # S-6 fix: only unpack coordinates AFTER threshold check passes
@@ -6302,7 +6932,9 @@ h1{{font-size:30px}}
                     dy = int(match_y) - pt.y
                     steps = 4
                     for s in range(1, steps + 1):
-                        user32.SetCursorPos(pt.x + dx * s // steps, pt.y + dy * s // steps)
+                        user32.SetCursorPos(
+                            pt.x + dx * s // steps, pt.y + dy * s // steps
+                        )
                         time.sleep(0.015)
 
                     time.sleep(0.150)  # settle delay
@@ -6524,7 +7156,11 @@ h1{{font-size:30px}}
                 timestamp=embed.get("timestamp"),
             )
             for field in embed.get("fields", []):
-                em.add_embed_field(name=field["name"], value=field["value"], inline=field.get("inline", True))
+                em.add_embed_field(
+                    name=field["name"],
+                    value=field["value"],
+                    inline=field.get("inline", True),
+                )
             wh.add_embed(em)
             wh.execute()
         except Exception as e:
@@ -6546,7 +7182,7 @@ h1{{font-size:30px}}
         ):
             return
         shot = self._ss_worker("_playback") if self.cfg.wh_screenshot else None
-        title = "" if was_loop else ""
+        title = "Loop Complete" if was_loop else "Play Complete"
         embed = {
             "author": {"name": "TinyKullan action completed"},
             "title": title,
@@ -6566,15 +7202,20 @@ h1{{font-size:30px}}
         if self.cfg.mention_id:
             payload["content"] = f"<@{self.cfg.mention_id}>"
         try:
-            wh = DiscordWebhook(url=url, username="TinyKullan",
-                                content=payload.get("content", ""))
+            wh = DiscordWebhook(
+                url=url, username="TinyKullan", content=payload.get("content", "")
+            )
             em = DiscordEmbed(
                 title=embed.get("title", ""),
                 color=embed.get("color", 0xFF4FD8),
                 timestamp=embed.get("timestamp"),
             )
             for field in embed.get("fields", []):
-                em.add_embed_field(name=field["name"], value=field["value"], inline=field.get("inline", True))
+                em.add_embed_field(
+                    name=field["name"],
+                    value=field["value"],
+                    inline=field.get("inline", True),
+                )
             wh.add_embed(em)
             if shot and Path(shot).exists():
                 with open(shot, "rb") as fp:
@@ -6939,9 +7580,7 @@ h1{{font-size:30px}}
                     "<Button-1>",
                     lambda _, a=attr, e=en: (
                         e.delete(0, "end"),
-                        e.insert(
-                            0, _pick_directory(title="Choose folder")
-                        ),
+                        e.insert(0, _pick_directory(title="Choose folder")),
                         setattr(self.cfg, a, e.get()),
                     ),
                 )
@@ -7009,7 +7648,7 @@ h1{{font-size:30px}}
             ("Play", "tiny_play"),
             ("Loop", "tiny_loop"),
             ("Save", "tiny_save"),
-            ("Pause", "tiny_delete"),
+            ("Pause", "tiny_pause"),
             ("Edit", "tiny_edit"),
         ]:
             _chk(inn1, f"  Show {label}", attr, self._apply_tiny)
@@ -7486,7 +8125,7 @@ h1{{font-size:30px}}
                         new_tgt["path"] = str(IMAGES_PATH / old_name)
                     updated_image_det.append(new_tgt)
 
-                self.events = events
+                self.events = [ev for ev in events if _valid_ev(ev)]
                 self.image_det_list = updated_image_det
                 self.temp_image_det_list = [dict(x) for x in updated_image_det]
 
@@ -7853,10 +8492,22 @@ h1{{font-size:30px}}
                                                 }
                                             ],
                                         }
-                                        _wh = DiscordWebhook(url=url, username="TinyKullan Image Detection Test")
-                                        _em = DiscordEmbed(title="\U0001f3af Image Detection Test: SUCCESS", color=0x50C878)
-                                        for _f in payload.get("embeds", [{}])[0].get("fields", []):
-                                            _em.add_embed_field(name=_f["name"], value=_f["value"], inline=_f.get("inline", True))
+                                        _wh = DiscordWebhook(
+                                            url=url,
+                                            username="TinyKullan Image Detection Test",
+                                        )
+                                        _em = DiscordEmbed(
+                                            title="\U0001f3af Image Detection Test: SUCCESS",
+                                            color=0x50C878,
+                                        )
+                                        for _f in payload.get("embeds", [{}])[0].get(
+                                            "fields", []
+                                        ):
+                                            _em.add_embed_field(
+                                                name=_f["name"],
+                                                value=_f["value"],
+                                                inline=_f.get("inline", True),
+                                            )
                                         _wh.add_embed(_em)
                                         _wh.execute()
                                     except Exception as wh_err:
@@ -7907,6 +8558,7 @@ h1{{font-size:30px}}
 
         def _add_image():
             from tkinter import filedialog
+
             file_paths = filedialog.askopenfilenames(
                 title="Select Target Images (multi-select)",
                 filetypes=[
@@ -7925,6 +8577,7 @@ h1{{font-size:30px}}
                     src_path = Path(file_path)
                     dest_path = IMAGES_PATH / src_path.name
                     shutil.copy2(src_path, dest_path)
+                    get_cached_template.cache_clear()
 
                     new_tgt = {
                         "path": str(dest_path),
@@ -8051,8 +8704,15 @@ h1{{font-size:30px}}
         roblox_link_en.pack(fill="x")
 
         roblox_test_btn = tk.Label(
-            inn7, text="  Test Link  ", bg=_C["go"], fg=SBG,
-            font=("Segoe UI", 8, "bold"), cursor="hand2", padx=8, pady=4)
+            inn7,
+            text="  Test Link  ",
+            bg=_C["go"],
+            fg=SBG,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+            padx=8,
+            pady=4,
+        )
         roblox_test_btn.pack(padx=PX, pady=(4, 2))
 
         def _test_open_link(e):
@@ -8060,19 +8720,99 @@ h1{{font-size:30px}}
             if not link:
                 self.set_status("No link entered!", _C["rec"], 2000)
                 return
-            import re
-            pm = re.search(r"/games/(\d+)", link)
-            if pm:
-                deeplink = "roblox://placeId=" + pm.group(1)
-                cm = re.search(r"privateServerLinkCode=([^&]+)", link)
-                if cm:
-                    deeplink += "&linkCode=" + cm.group(1)
-                try:
-                    os.startfile(deeplink)
-                    self.set_status("✓ Deeplink launched", _C["go"], 3000)
-                except Exception as ex:
-                    _LOG.error("Deeplink failed: %s", ex)
-                    self.set_status("✗ Failed to open", _C["rec"], 3000)
+
+            run_path = roblox_run_en.get().strip()
+            wait_time = roblox_wait_var.get()
+
+            def _test_recovery_worker():
+                import re
+
+                pm = re.search(r"/games/(\d+)", link)
+                if pm:
+                    deeplink = "roblox://placeId=" + pm.group(1)
+                    cm = re.search(r"privateServerLinkCode=([^&]+)", link)
+                    if cm:
+                        deeplink += "&linkCode=" + cm.group(1)
+                    try:
+                        os.startfile(deeplink)
+                        self.root.after(
+                            0,
+                            lambda: self.set_status(
+                                "✓ PS opened, waiting...", _C["go"], 3000
+                            ),
+                        )
+                    except Exception as ex:
+                        _LOG.error("Deeplink failed: %s", ex)
+                        self.root.after(
+                            0,
+                            lambda: self.set_status(
+                                "✗ Failed to open", _C["rec"], 3000
+                            ),
+                        )
+                        return
+                else:
+                    self.root.after(
+                        0,
+                        lambda: self.set_status(
+                            "✗ Invalid server link", _C["rec"], 3000
+                        ),
+                    )
+                    return
+
+                # Wait for Roblox to load (interruptible via stop event)
+                if wait_time > 0:
+                    _LOG.info("Test: waiting %.1fs for Roblox to load...", wait_time)
+                    for _ in range(int(wait_time * 10)):
+                        if self._stop_ev.is_set():
+                            return
+                        time.sleep(0.1)
+
+                # Run the recovery macro (disconnect run)
+                if run_path and os.path.exists(run_path):
+                    try:
+                        with open(run_path, encoding="utf-8") as rf:
+                            rec_data = json.load(rf)
+                        if isinstance(rec_data, list):
+                            rec_evs = [ev for ev in rec_data if _valid_ev(ev)]
+                            speed = max(0.1, min(10.0, self.cfg.speed))
+                            self.root.after(
+                                0,
+                                lambda: self.set_status(
+                                    "⚙️ Running recovery macro...", _C["go"], 2000
+                                ),
+                            )
+                            for ev in rec_evs:
+                                if self._stop_ev.is_set():
+                                    return
+                                delay = max(ev.get("d", 0), 0) / 1000.0 / speed
+                                if delay > 0:
+                                    time.sleep(delay)
+                                if self._stop_ev.is_set():
+                                    return
+                                self._replay(ev)
+                            self.root.after(
+                                0,
+                                lambda: self.set_status(
+                                    "✓ Recovery test complete", _C["go"], 3000
+                                ),
+                            )
+                    except Exception as rec_err:
+                        _LOG.error("Test recovery macro failed: %s", rec_err)
+                        self.root.after(
+                            0,
+                            lambda: self.set_status(
+                                "✗ Recovery macro failed", _C["rec"], 3000
+                            ),
+                        )
+                else:
+                    self.root.after(
+                        0,
+                        lambda: self.set_status(
+                            "✓ Test complete (no recovery run)", _C["go"], 3000
+                        ),
+                    )
+
+            threading.Thread(target=_test_recovery_worker, daemon=True).start()
 
         roblox_test_btn.bind("<Button-1>", _test_open_link)
 
@@ -8203,7 +8943,9 @@ h1{{font-size:30px}}
                     ],
                 }
                 wh = DiscordWebhook(url=url.strip(), username="TinyKullan")
-                em = DiscordEmbed(title="Test", color=0x9D7CFF, description="Connection confirmed!")
+                em = DiscordEmbed(
+                    title="Test", color=0x9D7CFF, description="Connection confirmed!"
+                )
                 wh.add_embed(em)
                 resp = wh.execute()
                 msg = (
@@ -8287,16 +9029,18 @@ def _splash(root):
             _ct.windll.user32.SetLayeredWindowAttributes(h, 0, 230, 0x02)
     except Exception:
         pass
-    
+
     # Let the splash show, then clear widgets and reset window geometry/attributes
     root.after(1200, lambda: _finish_splash(root))
     root.mainloop()
+
 
 def _finish_splash(root):
     for widget in root.winfo_children():
         widget.destroy()
     root.withdraw()
     root.quit()
+
 
 if __name__ == "__main__":
     if sys.platform == "win32":
