@@ -24,6 +24,7 @@ Global KeyHook := ""
 Global StopPath := ""
 Global WindowsMouseHook := 0
 Global SpeedMultiplier := 1.0
+Global LastPressTimes := Map()  ; filter OS auto-repeat keys during recording
 
 ; Command line argument parsing
 Global ImgClickX := 0
@@ -44,6 +45,8 @@ for index, arg in A_Args {
         Mode := "ImgClick"
         ImgClickX := Integer(A_Args[index + 1])
         ImgClickY := Integer(A_Args[index + 2])
+    } else if (arg = "/worker") {
+        Mode := "Worker"
     }
 }
 
@@ -70,6 +73,35 @@ If (Mode = "Play") {
     Sleep(50)
     Click("up")
     ExitApp()
+} Else if (Mode = "Worker") {
+    SendMode("Event")
+    CoordMode("Mouse", "Screen")
+    Loop {
+        signalPath := A_Temp "\TinyKullan_ahk_cmd.txt"
+        if FileExist(signalPath) {
+            try {
+                cmdLine := FileRead(signalPath)
+                FileDelete(signalPath)
+                cmdLine := Trim(cmdLine)
+                if (cmdLine = "exit") {
+                    ExitApp
+                }
+                if SubStr(cmdLine, 1, 5) = "click" {
+                    parts := StrSplit(cmdLine, " ")
+                    if parts.Length >= 3 {
+                        MouseMove(Integer(parts[2]), Integer(parts[3]), 0)
+                        Sleep(30)
+                        Click("down")
+                        Sleep(30)
+                        Click("up")
+                    }
+                }
+            } catch {
+                Sleep(500)
+            }
+        }
+        Sleep(50)
+    }
 }
 
 ; UI Creation (Standalone mode)
@@ -217,10 +249,13 @@ LowLevelMouseProc(nCode, wParam, lParam) {
             y := NumGet(lParam, 4, "Int")
 
             if (x != LastX || y != LastY) {
-                delay := Round(QPC() - StartTime)
-                Events.Push({t: "M", d: delay, x: x, y: y})
-                LastX := x
-                LastY := y
+                ; Only record moves > 3px to avoid jitter spam during playback
+                if (Abs(x - LastX) > 3 || Abs(y - LastY) > 3) {
+                    delay := Round(QPC() - StartTime)
+                    Events.Push({t: "M", d: delay, x: x, y: y})
+                    LastX := x
+                    LastY := y
+                }
             }
         }
     }
@@ -258,11 +293,18 @@ StopKeyboardHook() {
 }
 
 OnKeyPress(ih, vk, sc, extended := 0) {
-    Global Recording, Events, StartTime
+    Global Recording, Events, StartTime, LastPressTimes
     if (!Recording)
         Return
-    if (vk = 0x74 || vk = 0x75)
+    if (vk = 0x74 || vk = 0x75 || vk = 0x77)  ; skip F5/F6/F8
         Return
+
+    ; Filter OS auto-repeats: skip if same VK pressed within last 50ms
+    now := QPC()
+    if LastPressTimes.Has(vk) && (now - LastPressTimes[vk]) < 50
+        Return
+    LastPressTimes[vk] := now
+
     delay := Round(QPC() - StartTime)
     Events.Push({t: "K", d: delay, vk: vk, sc: sc, ext: extended, s: "Down"})
 }
@@ -271,7 +313,7 @@ OnKeyRelease(ih, vk, sc, extended := 0) {
     Global Recording, Events, StartTime
     if (!Recording)
         Return
-    if (vk = 0x74 || vk = 0x75)
+    if (vk = 0x74 || vk = 0x75 || vk = 0x77)
         Return
     delay := Round(QPC() - StartTime)
     Events.Push({t: "K", d: delay, vk: vk, sc: sc, ext: extended, s: "Up"})
@@ -306,7 +348,7 @@ StopPlayback() {
 }
 
 PlayWorker() {
-    Global Playing, Events, LoopPlayback, SpeedMultiplier
+    Global Playing, Events, LoopPlayback, SpeedMultiplier, HeldLeft, HeldRight, HeldMiddle
     Loop {
         if (!Playing)
             Break
@@ -349,16 +391,10 @@ PlayWorker() {
                     SendMouseInput(dx, dy, 0x0001)
                 }
             } else if (t = "C") {
-                ; Move relatively to target position first, then click
-                pt := Buffer(8, 0)
-                DllCall("GetCursorPos", "Ptr", pt)
-                currX := NumGet(pt, 0, "Int")
-                currY := NumGet(pt, 4, "Int")
-                dx := ev.x - currX
-                dy := ev.y - currY
-                if (dx != 0 || dy != 0) {
-                    SendMouseInput(dx, dy, 0x0001)
-                }
+                ; Use absolute positioning — bypasses mouse acceleration that
+                ; would cause large relative moves to drift.
+                SendMouseAbsolute(ev.x, ev.y)
+                Sleep(10)
                 btn := ev.b
                 state := ev.s
                 dwFlags := 0
@@ -450,6 +486,36 @@ SendMouseInput(dx, dy, dwFlags) {
     DllCall("SendInput", "UInt", 1, "Ptr", input, "Int", 40)
 }
 
+SendMouseAbsolute(screenX, screenY) {
+    ; Move to absolute screen coordinates on the virtual desktop.
+    ; Identical logic to Python's _abs() — accounts for multi-monitor
+    ; offsets and bypasses mouse acceleration entirely.
+    static vScreenX := 0, vScreenY := 0, vScreenW := 0, vScreenH := 0
+    if (!vScreenW) {
+        vScreenX := DllCall("GetSystemMetrics", "Int", 76)  ; SM_XVIRTUALSCREEN
+        vScreenY := DllCall("GetSystemMetrics", "Int", 77)  ; SM_YVIRTUALSCREEN
+        vScreenW := DllCall("GetSystemMetrics", "Int", 78)  ; SM_CXVIRTUALSCREEN
+        vScreenH := DllCall("GetSystemMetrics", "Int", 79)  ; SM_CYVIRTUALSCREEN
+        if (!vScreenW || !vScreenH) {
+            vScreenW := DllCall("GetSystemMetrics", "Int", 0)  ; SM_CXSCREEN
+            vScreenH := DllCall("GetSystemMetrics", "Int", 1)  ; SM_CYSCREEN
+            vScreenX := 0
+            vScreenY := 0
+        }
+    }
+    ax := Round((screenX - vScreenX) * 65535 / Max(vScreenW - 1, 1))
+    ay := Round((screenY - vScreenY) * 65535 / Max(vScreenH - 1, 1))
+    input := Buffer(40, 0)
+    NumPut("UInt", 0, input, 0)                      ; type = INPUT_MOUSE
+    NumPut("Int", ax, input, 8)                       ; dx (normalized 0-65535)
+    NumPut("Int", ay, input, 12)                      ; dy (normalized 0-65535)
+    NumPut("UInt", 0, input, 16)                     ; mouseData
+    NumPut("UInt", 0xC001, input, 20)                ; ABSOLUTE | VIRTUALDESKTOP | MOVE
+    NumPut("UInt", 0, input, 24)                     ; time
+    NumPut("UPtr", 0, input, 32)                     ; dwExtraInfo
+    DllCall("SendInput", "UInt", 1, "Ptr", input, "Int", 40)
+}
+
 SendKeyInput(vk, sc, up) {
     input := Buffer(40, 0)
     NumPut("UInt", 1, input, 0)
@@ -506,7 +572,7 @@ ReleaseAllHeld(exitReason := 0, exitCode := 0) {
             0x25, 0x26, 0x27, 0x28,          ; Arrows
             0x20, 0x0D, 0x1B, 0x09,          ; Space/Enter/Esc/Tab
             0x51, 0x45, 0x52, 0x46,          ; Q/E/R/F
-            0x08, 0x2E, 0x14, 0x2C,          ; BS/Del/Caps/PrtSc
+            0x08, 0x2E, 0x14,                ; BS/Del/Caps
             0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77,  ; F1-F8
             0x21, 0x22, 0x23, 0x24, 0x2D, 0x2E]  ; PgUp/Dn/End/Home/Ins/Del
     for idx, vk in vks {

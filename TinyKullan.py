@@ -66,11 +66,11 @@ try:
     cv2_present = True
     np_present = True
 except ImportError as e:
-    print(f"Missing dependency: {e}", file=sys.stderr)
-    print(
-        "Please install: pip install pynput pillow requests mss opencv-python numpy discord-webhook keyboard pystray",
-        file=sys.stderr,
-    )
+    msg = f"TinyKullan - Missing Dependencies\n\n{e}\n\nPlease run install.bat first, or paste this in your terminal:\npip install pynput pillow requests mss opencv-python numpy discord-webhook keyboard pystray"
+    try:
+        _ct.windll.user32.MessageBoxW(0, msg, "TinyKullan", 0x10)
+    except Exception:
+        print(msg, file=sys.stderr)
     cv2_present = False
     np_present = False
     sys.exit(1)
@@ -178,6 +178,15 @@ if sys.platform == "win32":
     user32.GetClientRect.restype = wintypes.BOOL
     user32.ClientToScreen.argtypes = [wintypes.HWND, _ct.c_void_p]
     user32.ClientToScreen.restype = wintypes.BOOL
+    user32.GetWindowRect.argtypes = [wintypes.HWND, _ct.c_void_p]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.mouse_event.argtypes = [
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ULONG_PTR,
+    ]
 
     # System Tray (Shell_NotifyIcon)
     NIM_ADD = 0x00000000
@@ -405,12 +414,12 @@ def _ahk_imgclick(x, y):
             return
     except Exception:
         pass
-    # Fallback
+    # Fallback - use hardware-level mouse_event which Roblox accepts
     user32.SetCursorPos(int(x), int(y))
     time.sleep(0.04)
-    _send_input(_mouse_button("left", False))
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # left down
     time.sleep(0.04)
-    _send_input(_mouse_button("left", True))
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # left up
 
 
 # ── AHK persistent worker (module-level state) ────────────────────────────────
@@ -426,7 +435,7 @@ def _get_ahk_worker_lock():
     return _ahk_worker_lock
 
 
-def _start_ahk_worker(self):
+def _start_ahk_worker():
     """Launch TinyKullan.ahk once with /worker and keep the Popen reference."""
     import subprocess
 
@@ -456,7 +465,7 @@ def _start_ahk_worker(self):
             return False
 
 
-def _ahk_send_command(self, cmd):
+def _ahk_send_command(cmd):
     """Write *cmd* to a temp signal file that the AHK /worker process polls."""
     global _ahk_worker_proc
 
@@ -486,20 +495,37 @@ def _write_csv_macro(events, filepath):
         writer = csv.writer(f, lineterminator="\n")
         for ev in events:
             t = ev.get("t", "")
-            d = int(ev.get("d", 0))
             x = int(ev.get("x", 0))
             y = int(ev.get("y", 0))
             btn = ev.get("btn", ev.get("b", ""))
-            if "up" in ev:
-                up = 1 if ev.get("up", False) else 0
-            else:
-                up = 1 if ev.get("s", "Down") == "Up" else 0
             vk = int(ev.get("vk", 0))
             scan = int(ev.get("scan", ev.get("sc", 0)))
             ext = 1 if ev.get("ext", False) else 0
             delta = int(ev.get("delta", 0))
             custom_name = urllib.parse.quote(ev.get("custom_name", ""), safe="")
-            writer.writerow([t, d, x, y, btn, up, vk, scan, ext, delta, custom_name])
+            if "up" in ev:
+                # Recorded event: single row with inter-event delay
+                d = int(ev.get("d", 0))
+                up = 1 if ev.get("up", False) else 0
+                writer.writerow(
+                    [t, d, x, y, btn, up, vk, scan, ext, delta, custom_name]
+                )
+            elif t in ("C", "K"):
+                # Hand-crafted click/key: emit down+up pair so AHK respects hold.
+                # AHK's LoadMacroFile accumulates delay BEFORE assigning ev.d,
+                # so the hold delay must be on the UP row.
+                hold_ms = max(1, int(ev.get("d", 0)))
+                writer.writerow([t, 0, x, y, btn, 0, vk, scan, ext, delta, custom_name])
+                writer.writerow(
+                    [t, hold_ms, x, y, btn, 1, vk, scan, ext, delta, custom_name]
+                )
+            else:
+                # Move / scroll / delay / other
+                d = int(ev.get("d", 0))
+                up = 1 if ev.get("s", "Down") == "Up" else 0
+                writer.writerow(
+                    [t, d, x, y, btn, up, vk, scan, ext, delta, custom_name]
+                )
 
 
 def _read_csv_macro(filepath):
@@ -551,6 +577,214 @@ def _read_csv_macro(filepath):
             if t in ("C", "K"):
                 ev["s"] = "Up" if up else "Down"
             events.append(ev)
+    return events
+
+
+# ── Compact run file format ───────────────────────────────────────────────────
+# TYPE|DURATION|DATA
+# Types: MOVE, MOUSE_DOWN, MOUSE_UP, KEY_DOWN, KEY_UP, SCROLL, SCROLL_H
+# Duration: ms since previous event
+#
+
+_VK_READABLE = {
+    0x08: "Backspace",
+    0x09: "Tab",
+    0x0D: "Enter",
+    0x10: "Shift",
+    0x11: "Control",
+    0x12: "Alt",
+    0x1B: "Escape",
+    0x20: "Space",
+    0x2E: "Delete",
+    0x5B: "LWin",
+    0x5C: "RWin",
+    0xA0: "LShift",
+    0xA1: "RShift",
+    0xA2: "LControl",
+    0xA3: "RControl",
+    0xA4: "LAlt",
+    0xA5: "RAlt",
+}
+
+
+def _vk_to_compact_name(vk, scan=0):
+    """Convert VK code to readable key name for compact format."""
+    if not vk:
+        return ""
+    if vk in _VK_READABLE:
+        return _VK_READABLE[vk]
+    if 0x41 <= vk <= 0x5A:
+        return chr(vk).lower()
+    if 0x30 <= vk <= 0x39:
+        return chr(vk)
+    if 0x70 <= vk <= 0x87:
+        return f"F{vk - 0x6F}"
+    return f"VK{vk}"
+
+
+def _write_compact_run(events, filepath):
+    """Save events in compact pipe-delimited format.
+    Produces files ~80% smaller than JSON with no structural bloat.
+    """
+    import urllib.parse
+
+    total = len(events)
+    now_str = datetime.now().strftime("%Y%m%d%H%M%S")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("# TinyKullan Recording\n")
+        f.write(f"# Generated: {now_str}\n")
+        f.write(f"# Total Events: {total}\n")
+        f.write("#\n")
+        f.write("# TYPE|DURATION|DATA\n")
+        f.write("#\n")
+
+        for ev in events:
+            t = ev.get("t", "")
+            d = ev.get("d", 0)
+            if isinstance(d, float):
+                d = max(0, int(d))
+            else:
+                d = max(0, int(d))
+
+            if t == "M":
+                x = ev.get("x", 0)
+                y = ev.get("y", 0)
+                prefix = "REL_" if ev.get("rel") else ""
+                f.write(f"{prefix}MOVE|{d}|{x},{y}\n")
+
+            elif t == "C":
+                up = ev.get("up", False)
+                typ = "MOUSE_UP" if up else "MOUSE_DOWN"
+                if ev.get("rel"):
+                    typ = "REL_" + typ
+                x = ev.get("x", 0)
+                y = ev.get("y", 0)
+                btn = ev.get("btn", "left")
+                f.write(f"{typ}|{d}|{x},{y}|{btn}\n")
+
+            elif t == "K":
+                up = ev.get("up", False)
+                typ = "KEY_UP" if up else "KEY_DOWN"
+                vk = ev.get("vk", 0)
+                scan = ev.get("scan", 0)
+                name = _vk_to_compact_name(vk, scan)
+                if name:
+                    f.write(f"{typ}|{d}|{name}\n")
+                else:
+                    f.write(f"{typ}|{d}|VK{vk}\n")
+
+            elif t in ("W", "WH"):
+                typ = "SCROLL_H" if t == "WH" else "SCROLL"
+                delta = ev.get("delta", 0)
+                f.write(f"{typ}|{d}|{delta}\n")
+
+            elif t == "I":
+                name = urllib.parse.quote(ev.get("name", ""), safe="")
+                action = ev.get("action", "click")
+                f.write(f"IMAGE|{d}|{name}|{action}\n")
+
+            elif t == "B":
+                name = urllib.parse.quote(ev.get("name", ""), safe="")
+                skip = ev.get("skip", 1)
+                f.write(f"BRANCH|{d}|{name}|{skip}\n")
+
+            elif t == "R":
+                name = urllib.parse.quote(ev.get("name", ""), safe="")
+                f.write(f"RUN|{d}|{name}\n")
+
+            elif t == "D":
+                f.write(f"DELAY|{d}|\n")
+
+
+def _read_compact_run(filepath):
+    """Load events from compact pipe-delimited format."""
+    import urllib.parse
+
+    events = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split("|")
+            if len(parts) < 2:
+                continue
+
+            typ = parts[0]
+            try:
+                d = int(parts[1])
+            except ValueError:
+                d = 0
+
+            if typ in ("MOVE", "REL_MOVE"):
+                rel = typ.startswith("REL_")
+                if len(parts) >= 3 and "," in parts[2]:
+                    xy = parts[2].split(",")
+                    x, y = int(xy[0]), int(xy[1])
+                    ev = {"t": "M", "d": d, "x": x, "y": y}
+                    if rel:
+                        ev["rel"] = True
+                    events.append(ev)
+
+            elif typ in ("MOUSE_DOWN", "MOUSE_UP", "REL_MOUSE_DOWN", "REL_MOUSE_UP"):
+                rel = typ.startswith("REL_")
+                up = typ.endswith("_UP") or typ == "MOUSE_UP" or typ == "REL_MOUSE_UP"
+                if len(parts) >= 3 and "," in parts[2]:
+                    xy = parts[2].split(",")
+                    x, y = int(xy[0]), int(xy[1])
+                    btn = parts[3] if len(parts) >= 4 else "left"
+                    ev = {"t": "C", "d": d, "btn": btn, "up": up, "x": x, "y": y}
+                    if rel:
+                        ev["rel"] = True
+                    events.append(ev)
+
+            elif typ in ("KEY_DOWN", "KEY_UP"):
+                up = typ == "KEY_UP"
+                key_name = parts[2] if len(parts) >= 3 else ""
+                vk = _name_to_vk(key_name)
+                scan = 0
+                if vk:
+                    try:
+                        scan = user32.MapVirtualKeyW(vk, 0)
+                    except Exception:
+                        pass
+                if not vk and key_name.startswith("VK"):
+                    try:
+                        vk = int(key_name[2:])
+                    except ValueError:
+                        vk = 0
+                events.append({"t": "K", "d": d, "vk": vk, "scan": scan, "up": up})
+
+            elif typ == "SCROLL":
+                delta = int(parts[2]) if len(parts) >= 3 else 0
+                events.append({"t": "W", "d": d, "delta": delta})
+
+            elif typ == "SCROLL_H":
+                delta = int(parts[2]) if len(parts) >= 3 else 0
+                events.append({"t": "WH", "d": d, "delta": delta})
+
+            elif typ == "IMAGE":
+                name = urllib.parse.unquote(parts[2]) if len(parts) >= 3 else ""
+                action = parts[3] if len(parts) >= 4 else "click"
+                events.append(
+                    {"t": "I", "d": d, "name": name, "img": name, "action": action}
+                )
+
+            elif typ == "BRANCH":
+                name = urllib.parse.unquote(parts[2]) if len(parts) >= 3 else ""
+                skip = int(parts[3]) if len(parts) >= 4 else 1
+                events.append(
+                    {"t": "B", "d": d, "name": name, "img": name, "skip": skip}
+                )
+
+            elif typ == "RUN":
+                name = urllib.parse.unquote(parts[2]) if len(parts) >= 3 else ""
+                events.append({"t": "R", "d": d, "name": name})
+
+            elif typ == "DELAY":
+                events.append({"t": "D", "d": d})
+
     return events
 
 
@@ -680,6 +914,16 @@ def _make_key(vk, scan, up, ext=False):
     i.union.ki.time = 0
     i.union.ki.dwExtraInfo = 0
     return i
+
+
+def _is_physically_down(vk):
+    """Return True if the key is physically held (hardware press).
+
+    GetAsyncKeyState reads the physical interrupt-level keyboard state.
+    Injected events from SendInput do NOT set this bit, so this reliably
+    distinguishes real user keypresses from macro-replayed ones.
+    """
+    return (user32.GetAsyncKeyState(vk) & 0x8000) != 0
 
 
 _PYNPUT_BTN = {
@@ -864,6 +1108,18 @@ try:
     _LOG.addHandler(_fh)
 except Exception:
     pass
+
+# ── Auto-create folder structure on first run ────────────────────────────────
+for _dir in [
+    RUNS_PATH,
+    IMAGES_PATH,
+    SHOT_PATH,
+]:
+    try:
+        _dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
 DEFAULT_THEME = {"primary": "#1D1128", "secondary": "#C3A5E5", "accent": "#7c5cfc"}
 _FC = {"go": "#22c55e", "rec": "#ef4444", "loop": "#f59e0b"}
 
@@ -1005,7 +1261,7 @@ def _load_tray_icon(path_str):
             draw.ellipse((4, 4, 60, 60), fill="#7c5cfc", outline="#a38eff", width=4)
             draw.polygon([(24, 18), (24, 48), (48, 33)], fill="white")
 
-        img = img.resize((32, 32), Image.LANCZOS)
+        img = img.resize((32, 32), Image.Resampling.LANCZOS)
         # Choose a safe write path
         if path_str:
             tmp = Path(path_str).parent / "_tray_icon.ico"
@@ -1090,20 +1346,18 @@ def _grab_screen(mss_instance=None):
 
 
 def _valid_ev(ev):
-    return (
-        isinstance(ev, dict)
-        and ev.get("t") in ("M", "C", "K", "W", "WH", "I", "R", "D")
-        and "d" in ev
-    )
-
-
-def _clean_events_for_save(events):
-    cleaned = []
-    for ev in events:
-        item = dict(ev)
-        item.pop("_ts", None)
-        cleaned.append(item)
-    return cleaned
+    if not (isinstance(ev, dict) and "d" in ev):
+        return False
+    t = ev.get("t", "")
+    if t not in ("M", "C", "K", "W", "WH", "I", "R", "D", "B"):
+        return False
+    if t == "M" and ("x" not in ev or "y" not in ev):
+        return False
+    if t == "C" and ("x" not in ev or "y" not in ev):
+        return False
+    if t == "K" and ("vk" not in ev):
+        return False
+    return True
 
 
 def _fmt_frog_dur(seconds):
@@ -1120,6 +1374,7 @@ class Config:
         self.key_save: str = "f8"
         self.key_autoclick: str = "f4"
         self.key_pause: str = "f9"
+        self.key_stop: str = "esc"
         self.save_path: str = ""
         self.shot_folder: str = str(SHOT_PATH)
         self.webhook_url: str = ""
@@ -1172,6 +1427,7 @@ class Config:
         self.roblox_wait_time: float = 5.0
         self.roblox_recovery_run: str = ""
         self.always_on_top: bool = False
+        self.record_relative_to_window: bool = False
 
     @property
     def DEFAULTS(self):
@@ -1182,6 +1438,7 @@ class Config:
             "key_save": "f8",
             "key_autoclick": "f4",
             "key_pause": "f9",
+            "key_stop": "esc",
             "save_path": "",
             "shot_folder": str(SHOT_PATH),
             "webhook_url": "",
@@ -1233,6 +1490,7 @@ class Config:
             "roblox_wait_time": 5.0,
             "roblox_recovery_run": "",
             "always_on_top": False,
+            "record_relative_to_window": False,
         }
 
     def load(self):
@@ -1257,6 +1515,7 @@ class Config:
         self.key_save = g("Hotkeys", "Save", fallback=self.key_save)
         self.key_autoclick = g("Hotkeys", "AutoClick", fallback=self.key_autoclick)
         self.key_pause = g("Hotkeys", "Pause", fallback=self.key_pause)
+        self.key_stop = g("Hotkeys", "Stop", fallback=self.key_stop)
         self.save_path = g("UI", "SavePath", fallback="")
         self.shot_folder = g("UI", "ShotFolder", fallback=self.shot_folder)
         for attr, section, key, cast in [
@@ -1318,6 +1577,7 @@ class Config:
         self.autoclick_btn = g("AutoClick", "Button", fallback=self.autoclick_btn)
         self.auto_focus = b("UI", "AutoFocus", False)
         self.always_on_top = b("UI", "AlwaysOnTop", False)
+        self.record_relative_to_window = b("UI", "RecordRelToWindow", False)
         try:
             self.stats_total_minutes = float(g("Stats", "TotalMinutes", fallback="0"))
         except ValueError:
@@ -1380,6 +1640,7 @@ class Config:
             "Save": self.key_save,
             "AutoClick": self.key_autoclick,
             "Pause": self.key_pause,
+            "Stop": self.key_stop,
         }
         cfg["UI"] = {
             "SavePath": self.save_path,
@@ -1389,6 +1650,7 @@ class Config:
             "AlphaUnfocused": str(self.alpha_unfocused),
             "AutoFocus": "1" if self.auto_focus else "0",
             "AlwaysOnTop": "1" if self.always_on_top else "0",
+            "RecordRelToWindow": "1" if self.record_relative_to_window else "0",
             **{
                 f"Tiny{k.capitalize()}": "1" if getattr(self, f"tiny_{k}") else "0"
                 for k in (
@@ -1829,7 +2091,7 @@ class App:
         self.root.attributes("-topmost", self.cfg.always_on_top)
         self.root.resizable(False, False)
         sw = self.root.winfo_screenwidth()
-        self.root.geometry(f"{WW}x{TH + 1 + BH}+{(sw - WW) // 2}+40")
+        self.root.geometry(f"{WW}x{TH + BH + 22}+{(sw - WW) // 2}+40")
         self.root._app_busy = lambda: (
             self.recording
             or self.playing
@@ -1933,6 +2195,31 @@ class App:
         self._sep.place(x=0, y=TH, width=WW)
         tk.Frame(self.root, bg=_C["bg"], bd=0).place(x=0, y=TH + 1, width=WW, height=BH)
 
+        # ── Log bar ─────────────────────────────────────
+        self._log_f = tk.Frame(self.root, bg=_C["pill"], bd=0)
+        self._log_f.place(x=0, y=TH + BH + 2, width=WW, height=20)
+        self._log_lbl = tk.Label(
+            self._log_f,
+            bg=_C["pill"],
+            fg="#ffffff",
+            font=("Segoe UI", 7),
+            anchor="w",
+            padx=6,
+            text="",
+        )
+        self._log_lbl.pack(side="left", fill="both", expand=True)
+        self._log_after = None
+
+        self._loop_warn = tk.Label(
+            self._log_f,
+            bg=_C["pill"],
+            fg="#ff4444",
+            font=("Segoe UI", 7),
+            padx=6,
+            text="esc = stop",
+        )
+        # hidden until toggle_loop places it
+
         self.c_rec = Col(
             self.root, 0, self.cfg.ico_record, "Record", self.toggle_record
         )
@@ -2024,7 +2311,7 @@ class App:
 
         cur = self.root.geometry().split("+")
         x, y = (cur[1] if len(cur) > 1 else "0"), (cur[2] if len(cur) > 2 else "40")
-        self.root.geometry(f"{new_w}x{TH + 1 + BH}+{x}+{y}")
+        self.root.geometry(f"{new_w}x{TH + BH + 22}+{x}+{y}")
         self._tb.place_configure(width=new_w)
         self._sep.place_configure(width=new_w)
 
@@ -2503,7 +2790,7 @@ class App:
         self.root.update_idletasks()
         try:
             _round_hwnd(_get_hwnd(self._draw_tools.winfo_id()))
-        except:
+        except Exception:
             pass
 
         tb = tk.Frame(self._draw_tools, bg=SBG)
@@ -2753,6 +3040,15 @@ class App:
                 ),
             )
 
+    def _log_message(self, text):
+        """Show a single log line in the bar, auto-clears after 2.5s."""
+        if not hasattr(self, "_log_lbl"):
+            return
+        self._log_lbl.config(text=text)
+        if self._log_after is not None:
+            self.root.after_cancel(self._log_after)
+        self._log_after = self.root.after(2500, lambda: self._log_lbl.config(text=""))
+
     def _update_kv(self, text):
         if self._kv_after is not None:
             self.root.after_cancel(self._kv_after)
@@ -2835,6 +3131,14 @@ class App:
             except Exception:
                 pass
             self._ahk_proc = None
+        # Terminate AHK persistent worker if active
+        global _ahk_worker_proc
+        if _ahk_worker_proc is not None:
+            try:
+                _ahk_worker_proc.terminate()
+            except Exception:
+                pass
+            _ahk_worker_proc = None
         # Release ALL held keys — prevent stuck modifiers
         try:
             self._release_held()
@@ -2899,6 +3203,8 @@ class App:
             except Exception:
                 pass
 
+        self.draw_mode = False  # stop draw loop
+
         if hasattr(self, "master") and self.master:
             self.master.destroy()
         else:
@@ -2908,6 +3214,21 @@ class App:
         self._hk_vks.clear()
         self._hotkey_defs = []
         self._hotkey_map = {}  # Fast direct VK→func lookup for simple hotkeys
+
+        # Build stop-key VK set (only used during playback)
+        self._stop_key_vks = set()
+        stop_raw = self.cfg.key_stop
+        if stop_raw and isinstance(stop_raw, str):
+            for part in stop_raw.lower().replace(" ", "").split("+"):
+                vk = _name_to_vk(part)
+                if vk:
+                    self._stop_key_vks.add(vk)
+                    if vk == 0x10:
+                        self._stop_key_vks.update({0xA0, 0xA1})
+                    elif vk == 0x11:
+                        self._stop_key_vks.update({0xA2, 0xA3})
+                    elif vk == 0x12:
+                        self._stop_key_vks.update({0xA4, 0xA5})
         _MODIFIER_VKS = {
             0x10,
             0x11,
@@ -2964,9 +3285,7 @@ class App:
         if not vk:
             return
 
-        # Catch OS auto-repeat spam
         is_auto_repeat = vk in self._currently_pressed_vks
-
         self._currently_pressed_vks.add(vk)
         if vk == 0x10:
             self._currently_pressed_vks.update({0xA0, 0xA1})
@@ -2975,8 +3294,48 @@ class App:
         elif vk == 0x12:
             self._currently_pressed_vks.update({0xA4, 0xA5})
 
+        # Escape always stops playback
+        if vk == 0x1B and not is_auto_repeat:
+            if self.playing or self.looping:
+                self.root.after(0, self._stop_playback)
+                return
+
+        # During playback: check stop key
+        if not is_auto_repeat and (self.playing or self.looping):
+            if self._stop_key_vks:
+                # Single-key stop: trust it (the macro won't send esc/f-keys alone)
+                if len(self._stop_key_vks) == 1:
+                    if vk in self._stop_key_vks:
+                        self.root.after(0, self._stop_playback)
+                        return
+                # Combo stop: verify all modifiers are physically held
+                else:
+                    all_held = True
+                    for svk in self._stop_key_vks:
+                        if svk in (0x10, 0xA0, 0xA1):
+                            if not ((user32.GetAsyncKeyState(0x10) | user32.GetAsyncKeyState(0xA0) | user32.GetAsyncKeyState(0xA1)) & 0x8000):
+                                all_held = False; break
+                        elif svk in (0x11, 0xA2, 0xA3):
+                            if not ((user32.GetAsyncKeyState(0x11) | user32.GetAsyncKeyState(0xA2) | user32.GetAsyncKeyState(0xA3)) & 0x8000):
+                                all_held = False; break
+                        elif svk in (0x12, 0xA4, 0xA5):
+                            if not ((user32.GetAsyncKeyState(0x12) | user32.GetAsyncKeyState(0xA4) | user32.GetAsyncKeyState(0xA5)) & 0x8000):
+                                all_held = False; break
+                        elif svk in (0x5B, 0x5C):
+                            if not ((user32.GetAsyncKeyState(0x5B) | user32.GetAsyncKeyState(0x5C)) & 0x8000):
+                                all_held = False; break
+                        elif svk not in self._currently_pressed_vks:
+                            all_held = False
+                            break
+                    if all_held:
+                        self.root.after(0, self._stop_playback)
+                        return
+            if not self.recording:
+                self._on_key_press(key, is_auto_repeat=is_auto_repeat)
+            return
+
         if getattr(self, "_hk_suppressed", False):
-            self._on_key_press(key)
+            self._on_key_press(key, is_auto_repeat=is_auto_repeat)
             return
 
         triggered_func = None
@@ -3018,12 +3377,13 @@ class App:
                     break
 
         if triggered_func:
-            # Trigger instantly on first press, ignore held auto-repeats
             if not is_auto_repeat:
-                self.root.after(0, triggered_func)
+                if not (self.playing or self.looping):
+                    self.root.after(0, triggered_func)
             return
 
-        self._on_key_press(key)
+        if not self.recording:
+            self._on_key_press(key, is_auto_repeat=is_auto_repeat)
 
     def _global_on_release(self, key):
         vk, scan, ext = _key_to_vk(key)
@@ -3038,7 +3398,9 @@ class App:
         elif vk == 0x12:
             self._currently_pressed_vks.difference_update({0xA4, 0xA5})
 
-        self._on_key_release(key)
+        # AHK handles recording; don't record releases either
+        if not self.recording:
+            self._on_key_release(key)
 
     def _pause_hk_listener(self):
         self._hk_suppressed = True
@@ -3147,150 +3509,113 @@ class App:
         self.recording = True
         with self._click_lock:
             self._clicked_this_run = set()
-        # BUG-6: flush unsaved UI changes to the worker's list before recording
         if self.temp_image_det_list:
             with self._img_cache_lock:
                 self.image_det_list = [dict(x) for x in self.temp_image_det_list]
-        self._rec_pressed_keys = set()
-        self._rec_pressed_btns = set()
-        self._rec_start_perf = time.perf_counter()
-        self._last_ms = self._rec_start = _ms()
-        try:
-            pt = POINT()
-            user32.GetCursorPos(_ct.byref(pt))
-            self._last_move_x, self._last_move_y = int(pt.x), int(pt.y)
-        except Exception:
-            self._last_move_x = self._last_move_y = 0
-        self._last_move_ms = self._last_ms
 
         self.c_rec.ico.config(text="⏹")
         self.c_rec.lbl.config(text="Stop")
         self.set_status("⏺ REC", _C["rec"])
+        self._log_message("> recording started")
         self._anim_tick()
-        self._build_hk_vks()
 
         try:
             ahk_path = _find_autohotkey()
             script_dir = os.path.dirname(os.path.abspath(__file__))
             ahk_script = os.path.join(script_dir, "TinyKullan.ahk")
             if not os.path.exists(ahk_script):
-                raise FileNotFoundError(f"TinyKullan.ahk not found at {ahk_script}")
+                raise FileNotFoundError(f"TinyKullan.ahk not found")
             if not os.path.exists(ahk_path):
                 raise FileNotFoundError(f"AutoHotkey not found: {ahk_path}")
+
             import tempfile
 
             macro_temp = os.path.join(
                 tempfile.gettempdir(), f"tkmacro_record_{os.getpid()}.txt"
             )
             stop_temp = macro_temp + ".stop"
-            for temp_path in (macro_temp, stop_temp):
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+            for tp in (macro_temp, stop_temp):
+                try:
+                    if os.path.exists(tp):
+                        os.remove(tp)
+                except Exception:
+                    pass
             self._record_macro_temp = macro_temp
             self._record_stop_temp = stop_temp
-            self._record_stop_pending = False
 
             import subprocess
 
-            _LOG.info(
-                "AHK RECORD: exe=%s  script=%s",
-                os.path.abspath(ahk_path),
-                os.path.abspath(ahk_script),
-            )
             self._ahk_proc = subprocess.Popen(
                 [ahk_path, ahk_script, "/record", macro_temp],
                 creationflags=0x08000000 if sys.platform == "win32" else 0,
             )
-            self._record_event = (
-                self._record_event_pynput
-            )  # Use pynput fallback recording
-            self.root.after(100, self._monitor_recording, macro_temp)
+        except FileNotFoundError as e:
+            _LOG.error("AHK not found: %s", e)
+            self.set_status("AHK not installed - run install.bat", _C["rec"], 4000)
+            self.recording = False
+            self.c_rec.ico.config(text=self.cfg.ico_record)
+            self.c_rec.lbl.config(text="Record")
         except Exception as e:
             _LOG.error("Failed to start AHK recorder: %s", e)
-            self.set_status("AHK not found - using pynput", _C["loop"], 2000)
-            self._ahk_proc = None
-            self._record_event = self._record_event_pynput
-            # Bug 1: Start pynput mouse listener for fallback recording
-            self._mouse_l = _pmouse.Listener(
-                on_move=self._on_move,
-                on_click=self._on_click,
-                on_scroll=self._on_scroll,
-            )
-            self._mouse_l.start()
+            self.set_status("Record failed", _C["rec"], 3000)
+            self.recording = False
+            self.c_rec.ico.config(text=self.cfg.ico_record)
+            self.c_rec.lbl.config(text="Record")
 
-    def _monitor_recording(self, macro_temp):
-        if self._ahk_proc is not None:
-            if self._ahk_proc.poll() is not None:
-                self._ahk_proc = None
-                self._stop_recording(from_ahk=True, macro_temp=macro_temp)
-                return
-
-        if self.recording or getattr(self, "_record_stop_pending", False):
-            self.root.after(50, self._monitor_recording, macro_temp)
-
-    def _stop_recording(self, from_ahk=False, macro_temp=None):
-        if not self.recording and not from_ahk:
+    def _stop_recording(self):
+        if not self.recording:
             return
-
         if self._blink_after is not None:
             self.root.after_cancel(self._blink_after)
             self._blink_after = None
 
-        if not from_ahk and self._ahk_proc is not None:
-            if getattr(self, "_record_stop_pending", False):
-                return
-            self._record_stop_pending = True
-            macro_temp = macro_temp or getattr(
-                self, "_record_macro_temp", os.path.join(sys.path[0], "temp_macro.txt")
-            )
-            stop_temp = getattr(self, "_record_stop_temp", macro_temp + ".stop")
-            try:
-                with open(stop_temp, "w", encoding="utf-8") as f:
-                    f.write("stop")
-                self.c_rec.ico.config(text="⏳")
-                self.c_rec.lbl.config(text="Saving")
-                self.set_status("Saving...", _C["loop"], 1500)
-                self.root.after(50, self._monitor_recording, macro_temp)
-                return
-            except Exception as e:
-                _LOG.error("Failed to signal AHK recorder stop: %s", e)
+        if self._ahk_proc is not None:
+            stop_temp = getattr(self, "_record_stop_temp", "")
+            self.c_rec.ico.config(text="⏳")
+            self.set_status("Saving...", _C["loop"], 3000)
+            ahk = self._ahk_proc
+            self._ahk_proc = None
+            macro_temp = getattr(self, "_record_macro_temp", "")
+
+            def _wait_ahk():
+                try:
+                    with open(stop_temp, "w", encoding="utf-8") as f:
+                        f.write("stop")
+                    ahk.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        ahk.kill()
+                        ahk.wait(timeout=1)
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        ahk.terminate()
+                    except Exception:
+                        pass
+                self.root.after(0, lambda: self._finish_recording(macro_temp))
+
+            self.recording = False
+            threading.Thread(target=_wait_ahk, daemon=True).start()
+            return
 
         self.recording = False
-        self._record_stop_pending = False
-        self._release_held()  # release any keys/buttons held during recording stop
-        macro_temp = macro_temp or getattr(
-            self, "_record_macro_temp", os.path.join(sys.path[0], "temp_macro.txt")
-        )
+        self._finish_recording(getattr(self, "_record_macro_temp", ""))
 
-        for _ in range(10):
-            if macro_temp and os.path.exists(macro_temp):
-                break
-            time.sleep(0.02)
+    def _finish_recording(self, macro_temp):
+        self._release_held()
         if macro_temp and os.path.exists(macro_temp):
             try:
                 self.events = _read_csv_macro(macro_temp)
-                if os.path.exists(macro_temp):
-                    os.remove(macro_temp)
-            except Exception as e:
-                _LOG.error("Failed to read recorded events: %s", e)
-
-        # Bug 1: Stop pynput mouse listener if it was started (fallback mode)
-        if self._mouse_l:
-            try:
-                self._mouse_l.stop()
+                os.remove(macro_temp)
             except Exception:
                 pass
-            self._mouse_l = None
-
-        self._rec_dur = 0
-        if self.events:
-            self._rec_dur = sum(ev.get("d", 0) for ev in self.events)
 
         self.c_rec.ico.config(text=self.cfg.ico_record)
         self.c_rec.lbl.config(text="Record")
-
         self.root.after(0, self._reset_ui)
-        self.set_status(f"■ {len(self.events)} ev", _C["go"], 3000)
+        self.set_status(f"Done ({len(self.events)} ev)", _C["go"], 3000)
+        self._log_message(f"> recorded {len(self.events)} events")
         threading.Thread(target=self._webhook, args=("record",), daemon=True).start()
         self._auto_save_run()
 
@@ -3333,109 +3658,9 @@ class App:
                 return True
         return False
 
-    def _record_event_pynput(self, ev, ts=None):
-        with self._ev_lock:
-            ev = dict(ev)
-            ev["_ts_perf"] = time.perf_counter() - self._rec_start_perf
-            self.events.append(ev)
-
-    def _record_event(self, ev, ts=None):
-        self._record_event_pynput(ev, ts)
-
-    def _on_move(self, x, y):
-        if not self.recording:
+    def _on_key_press(self, key, is_auto_repeat=False):
+        if is_auto_repeat:
             return
-        if self._cached_bounds(x, y):
-            return
-
-        # Rate-limit mouse move recording to at most once every 5ms (200Hz)
-        # to prevent event overload while keeping smooth movement
-        now_ms = _ms()
-        if now_ms - self._last_move_ms < 5:
-            return
-        self._last_move_ms = now_ms
-
-        xi, yi = int(x), int(y)
-
-        # Check if this move is a Roblox/game warp-back to client center
-        try:
-            hwnd = user32.GetForegroundWindow()
-            if hwnd:
-                rect = RECT()
-                if user32.GetClientRect(hwnd, _ct.byref(rect)):
-                    pt = POINT()
-                    pt.x = (rect.left + rect.right) // 2
-                    pt.y = (rect.top + rect.bottom) // 2
-                    if user32.ClientToScreen(hwnd, _ct.byref(pt)):
-                        # If the event destination is exactly the center of the active window,
-                        # and we are in a game (cursor locked/centered), ignore the warp-back.
-                        if xi == pt.x and yi == pt.y:
-                            # Update our last move track so the next physical move's dx/dy is calculated correctly
-                            self._last_move_x, self._last_move_y = xi, yi
-                            return
-        except Exception:
-            pass
-
-        dx = xi - self._last_move_x
-        dy = yi - self._last_move_y
-        self._last_move_x, self._last_move_y = xi, yi
-        self._record_event({"t": "M", "d": 0, "x": xi, "y": yi, "dx": dx, "dy": dy})
-
-    def _on_click(self, x, y, button, pressed):
-        btn = _PYNPUT_BTN.get(button, str(button).split(".")[-1].lower())
-        if pressed:
-            m_map = {
-                "left": "m1",
-                "right": "m2",
-                "middle": "m3",
-                "x1": "m4",
-                "x2": "m5",
-            }
-            self.root.after(0, lambda: self._maybe_update_kv(m_map.get(btn, btn[:2])))
-        if not self.recording or self._cached_bounds(x, y):
-            return
-        if pressed and btn in self._rec_pressed_btns:
-            return
-        if pressed:
-            self._rec_pressed_btns.add(btn)
-        else:
-            self._rec_pressed_btns.discard(btn)
-        self._record_event(
-            {
-                "t": "C",
-                "d": 0,
-                "btn": btn,
-                "up": not pressed,
-                "x": int(x),
-                "y": int(y),
-            }
-        )
-
-    def _on_scroll(self, x, y, dx, dy):
-        if not self.recording or self._cached_bounds(x, y):
-            return
-        if dy:
-            self._record_event(
-                {
-                    "t": "W",
-                    "d": 0,
-                    "delta": int(dy * 120),
-                    "x": int(x),
-                    "y": int(y),
-                }
-            )
-        if dx:
-            self._record_event(
-                {
-                    "t": "WH",
-                    "d": 0,
-                    "delta": int(dx * 120),
-                    "x": int(x),
-                    "y": int(y),
-                }
-            )
-
-    def _on_key_press(self, key):
         vk, scan, ext = _key_to_vk(key)
         if vk:
             _KMAP = {
@@ -3463,27 +3688,9 @@ class App:
                 else str(key).replace("'", "")[:2]
             )
             self.root.after(0, self._maybe_update_kv, txt)
-        if not self.recording or not vk or vk in self._hk_vks:
-            return
-        if vk in self._rec_pressed_keys:
-            return
-        self._rec_pressed_keys.add(vk)
-        self._record_event(
-            {"t": "K", "d": 0, "vk": vk, "scan": scan, "ext": ext, "up": False}
-        )
 
     def _on_key_release(self, key):
-        vk, scan, ext = _key_to_vk(key)
-        if not self.recording:
-            return
-        if not vk or vk in self._hk_vks:
-            return
-        if vk not in self._rec_pressed_keys:
-            return
-        self._rec_pressed_keys.discard(vk)
-        self._record_event(
-            {"t": "K", "d": 0, "vk": vk, "scan": scan, "ext": ext, "up": True}
-        )
+        pass
 
     def toggle_play(self):
         if not self._can_start():
@@ -3496,6 +3703,7 @@ class App:
         self.c_play.ico.config(text="⏹")
         self.c_play.lbl.config(text="Stop")
         self.set_status("▶ Playing", _C["go"])
+        self._log_message("> playback started")
         self._anim_tick()
 
         # Start AHK playback process in background thread
@@ -3513,7 +3721,10 @@ class App:
         self._stop_ev.clear()
         self.c_loop.ico.config(text="⏹")
         self.c_loop.lbl.config(text="Stop")
-        self.set_status("∞ LOOP", _C["loop"])
+        self.set_status("\u221e LOOP", _C["loop"])
+        stop_key = self.cfg.key_stop or "esc"
+        self._loop_warn.config(text=f"{stop_key} = stop")
+        self._loop_warn.place(relx=1.0, rely=0.5, anchor="e", x=-50)
         self._anim_tick()
 
         # Start AHK playback process with looping in background thread
@@ -3598,162 +3809,127 @@ class App:
         self.c_pause.ico.config(text="\u23f8")
         self.c_pause.lbl.config(text="Pause")
         self._pause_playback = False
+        if hasattr(self, "_loop_warn"):
+            self._loop_warn.place_forget()
+            self._loop_warn.config(text="")
 
     def _ahk_playback_worker(self, loop):
         t0 = time.perf_counter()
+        ahk_path = _find_autohotkey()
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        ahk_script = os.path.join(script_dir, "TinyKullan.ahk")
+
+        if not os.path.exists(ahk_script) or not os.path.exists(ahk_path):
+            self.set_status("AHK not installed", _C["rec"], 4000)
+            self.playing = self.looping = False
+            self.root.after(0, self._reset_ui)
+            return
+
+        import subprocess
+        import tempfile
+
+        _cleanup_macro_temp = None
         try:
-            ahk_path = _find_autohotkey()
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            ahk_script = os.path.join(script_dir, "TinyKullan.ahk")
-
-            if not os.path.exists(ahk_script) or not os.path.exists(ahk_path):
-                raise FileNotFoundError("AHK script or binary not found")
-
-            import tempfile
-
-            _cleanup_macro_temp = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    suffix=".txt",
-                    prefix="tkmacro_",
-                    delete=False,
-                    encoding="utf-8",
-                ) as tf:
-                    macro_temp = tf.name
-                    _cleanup_macro_temp = macro_temp
-            except Exception:
-                macro_temp = os.path.join(script_dir, f"temp_macro_{os.getpid()}.txt")
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".txt",
+                prefix="tkmacro_",
+                delete=False,
+                encoding="utf-8",
+            ) as tf:
+                macro_temp = tf.name
                 _cleanup_macro_temp = macro_temp
+        except Exception:
+            macro_temp = os.path.join(script_dir, f"temp_macro_{os.getpid()}.txt")
+            _cleanup_macro_temp = macro_temp
 
-            # Write events to temp CSV file (with lock — C-1 fix)
-            with self._ev_lock:
-                evs_snapshot = list(self.events)
-            _write_csv_macro(evs_snapshot, macro_temp)
+        with self._ev_lock:
+            evs_snapshot = list(self.events)
+        _write_csv_macro(evs_snapshot, macro_temp)
 
-            import subprocess
+        speed = max(0.1, min(10.0, self.cfg.speed))
+        args = [ahk_path, ahk_script, "/play", macro_temp]
+        if speed != 1.0:
+            args.extend(["/speed", str(speed)])
+        creationflags = 0x08000000 if sys.platform == "win32" else 0
 
-            args = [ahk_path, ahk_script, "/play", macro_temp]
-            if loop:
-                args.append("/loop")
-            speed = max(0.1, min(10.0, self.cfg.speed))
-            if speed != 1.0:
-                args.extend(["/speed", str(speed)])
-            _LOG.info(
-                "AHK PLAY: exe=%s  script=%s",
-                os.path.abspath(ahk_path),
-                os.path.abspath(ahk_script),
-            )
-            self._ahk_proc = subprocess.Popen(
-                args, creationflags=0x08000000 if sys.platform == "win32" else 0
-            )
+        iteration = [0]
+        _LOG.info(
+            "AHK PLAY: exe=%s  script=%s",
+            os.path.abspath(ahk_path),
+            os.path.abspath(ahk_script),
+        )
 
-            self._ahk_proc.wait()
-            self._ahk_proc = None
-
-            # If recovery terminated us, let IT handle the restart — don't run cleanup
-            if getattr(self, "_recovering", False):
-                return
-
+        def _cleanup():
             try:
                 if _cleanup_macro_temp and os.path.exists(_cleanup_macro_temp):
                     os.remove(_cleanup_macro_temp)
             except Exception:
                 pass
 
-        except Exception as e:
+        def _finish(err=None):
+            if self._ahk_proc is not None:
+                try:
+                    self._ahk_proc.terminate()
+                except Exception:
+                    pass
+                self._ahk_proc = None
+            _cleanup()
             if getattr(self, "_recovering", False):
                 return
-            _LOG.error("AHK playback failed, using Python fallback: %s", e)
+            play_ms = int((time.perf_counter() - t0) * 1000)
+            self.playing = self.looping = False
+            self.root.after(0, self._reset_ui)
+            if err:
+                self.root.after(0, lambda: self.set_status(err, _C["rec"], 4000))
+            elif loop and iteration[0] > 1:
+                self.root.after(
+                    0,
+                    lambda: self.set_status(f"∞ {iteration[0]} loops", _C["go"], 2000),
+                )
+            else:
+                self.root.after(0, lambda: self.set_status("✓ Done", _C["go"], 1500))
+            threading.Thread(
+                target=self._post_play, args=(play_ms, loop), daemon=True
+            ).start()
+
+        def _on_ahk_done():
+            self._ahk_proc = None
+            iteration[0] += 1
+            if self._stop_ev.is_set() or not loop:
+                _finish()
+                return
             self.root.after(
-                0, lambda: self.set_status("AHK fail - Python mode", _C["loop"], 2000)
+                0,
+                lambda: self.set_status(
+                    f"\u221e {iteration[0]}  |  esc = stop", _C["loop"]
+                ),
             )
-            # C-3 fix: guarantee flag reset even if fallback itself throws
+            # Schedule next iteration via main loop
+            self.root.after(50, _spawn)
+
+        def _spawn():
+            if self._stop_ev.is_set():
+                _finish()
+                return
             try:
-                self._playback_python_fallback(loop, t0)
-            finally:
-                self.playing = self.looping = False
-                self.root.after(0, self._reset_ui)
-            return
+                self._ahk_proc = subprocess.Popen(args, creationflags=creationflags)
+            except Exception as e:
+                _LOG.error("AHK spawn failed: %s", e)
+                _finish("AHK spawn failed")
+                return
+            self.root.after(100, _poll)
 
-        play_ms = int((time.perf_counter() - t0) * 1000)
-        self.playing = self.looping = False
-        self.root.after(0, self._reset_ui)
-        self.root.after(0, lambda: self.set_status("✓ Done", _C["go"], 1500))
-        threading.Thread(
-            target=self._post_play, args=(play_ms, loop), daemon=True
-        ).start()
+        def _poll():
+            if self._ahk_proc is None:
+                return
+            ret = self._ahk_proc.poll()
+            if ret is None:
+                self.root.after(100, _poll)
+            else:
+                _on_ahk_done()
 
-    def _playback_python_fallback(self, loop, t0):
-        """Fallback playback using Python-native _replay when AHK is unavailable."""
-        try:
-            _ct.windll.kernel32.SetThreadPriority(
-                _ct.windll.kernel32.GetCurrentThread(), 2
-            )
-        except Exception:
-            pass
-        with self._ev_lock:
-            evs = list(self.events)
-        speed = max(0.1, min(10.0, self.cfg.speed))
-        try:
-            while True:
-                if self._stop_ev.is_set():
-                    break
-                start = time.perf_counter()
-                abs_delay = 0.0  # accumulator for relative delays → absolute timeline
-                i = 0
-                while i < len(evs):
-                    if self._stop_ev.is_set():
-                        break
-                    ev = evs[i]
-                    # Handle branch: if image not found, skip N events
-                    if ev.get("t") == "B":
-                        img_name = ev.get("name") or ev.get("img", "")
-                        found = False
-                        if img_name:
-                            img_path = self._resolve_image_path(img_name)
-                            if img_path:
-                                try:
-                                    import cv2
-                                    import numpy as np
-
-                                    template = get_cached_template(img_path)
-                                    if template is not None:
-                                        screen = _grab_screen()
-                                        screen_bgr = cv2.cvtColor(
-                                            np.array(screen), cv2.COLOR_RGB2BGR
-                                        )
-                                        val, _ = self._find_best_match(
-                                            screen_bgr, template
-                                        )
-                                        found = val >= 0.55
-                                except Exception:
-                                    pass
-                        if not found:
-                            skip = max(1, int(ev.get("skip", 1)))
-                            i += skip
-                            continue
-                        i += 1
-                        continue
-                    abs_delay += max(ev.get("d", 0), 0) / 1000.0 / speed
-                    target = start + abs_delay
-                    while time.perf_counter() < target:
-                        if self._stop_ev.is_set():
-                            break
-                        time.sleep(0.001)
-                    self._replay(ev, speed=speed)
-                    i += 1
-                if not loop:
-                    break
-        finally:
-            pass
-        play_ms = int((time.perf_counter() - t0) * 1000)
-        self.playing = self.looping = False
-        self.root.after(0, self._reset_ui)
-        self.root.after(0, lambda: self.set_status("✓ Done", _C["go"], 1500))
-        threading.Thread(
-            target=self._post_play, args=(play_ms, loop), daemon=True
-        ).start()
+        self.root.after(0, _spawn)
 
     def _calc_activity_score(self, hours, runs):
         """Calculate activity score from runs and hours using idea math.
@@ -4726,6 +4902,8 @@ h1{{font-size:30px}}
                     font=("Consolas", 8),
                     width=6,
                 )
+                # Auto-apply on focus loss
+                ent.bind("<FocusOut>", lambda _e: _apply())
                 ent.pack(side="left", fill="x", expand=True)
                 if key == "x":
                     # Add a coordinate select button next to X/Y
@@ -4807,6 +4985,9 @@ h1{{font-size:30px}}
                     font=("Consolas", 8),
                     width=12,
                 )
+                # Auto-apply on focus loss so edits aren't silently discarded
+                # when the user clicks Play or another event without pressing Enter.
+                ent.bind("<FocusOut>", lambda _e: _apply())
             if key != "x" and key != "y":
                 ent.pack(side="left", fill="x", expand=True)
             field_vars[key] = (var, row, lbl_w)
@@ -5212,6 +5393,9 @@ h1{{font-size:30px}}
                                 ev["d"] = max(1, int(field_vars["d"][0].get()))
                             except ValueError:
                                 ev["d"] = 100
+                            # Remove "up" so replay takes the press-hold-release
+                            # path that respects the duration field.
+                            ev.pop("up", None)
                         else:
                             ev["d"] = 0
                     # Apply position
@@ -5361,9 +5545,7 @@ h1{{font-size:30px}}
             save_state()
             with self._ev_lock:
                 pos = len(self.events)
-                self.events.append(
-                    {"t": "C", "btn": "left", "up": False, "x": x, "y": y, "d": 100}
-                )
+                self.events.append({"t": "C", "btn": "left", "x": x, "y": y, "d": 100})
             _refresh_list(select=pos)
 
         def _add_key():
@@ -5378,7 +5560,6 @@ h1{{font-size:30px}}
                         if sys.platform == "win32"
                         else 0,
                         "ext": False,
-                        "up": False,
                         "d": 100,  # 100ms key hold duration
                     }
                 )
@@ -5640,7 +5821,7 @@ h1{{font-size:30px}}
                 getattr(self, "_pause_playback", False) and not self._stop_ev.is_set()
             ):
                 time.sleep(0.01)
-            self._replay(ev, depth + 1)
+            self._replay(ev, depth + 1, speed)
 
     def _replay(self, ev, depth=0, speed=1.0):
         t = ev.get("t", "")
@@ -5648,61 +5829,43 @@ h1{{font-size:30px}}
             if t == "M":
                 cx, cy = int(ev["x"]), int(ev["y"])
 
-                # Check if cursor is locked/centered in the active window (camera mode)
-                is_cursor_locked = False
-                try:
-                    hwnd = user32.GetForegroundWindow()
-                    if hwnd:
-                        rect = RECT()
-                        if user32.GetClientRect(hwnd, _ct.byref(rect)):
-                            pt_center = POINT()
-                            pt_center.x = (rect.left + rect.right) // 2
-                            pt_center.y = (rect.top + rect.bottom) // 2
-                            if user32.ClientToScreen(hwnd, _ct.byref(pt_center)):
-                                pt_curr = POINT()
-                                if user32.GetCursorPos(_ct.byref(pt_curr)):
-                                    if (
-                                        abs(pt_curr.x - pt_center.x) <= 2
-                                        and abs(pt_curr.y - pt_center.y) <= 2
-                                    ):
-                                        is_cursor_locked = True
-                except Exception:
-                    pass
+                if ev.get("rel"):
+                    try:
+                        hwnd = user32.GetForegroundWindow()
+                        if hwnd:
+                            rect = RECT()
+                            if user32.GetWindowRect(hwnd, _ct.byref(rect)):
+                                cx += rect.left
+                                cy += rect.top
+                    except Exception:
+                        pass
 
-                # Bug 17: Skip absolute repositioning when cursor is locked/centered (camera mode)
-                if is_cursor_locked:
-                    return
-
-                # ALWAYS use relative movement — never teleport with SetCursorPos
+                # Match AHK: GetCursorPos + SendInput relative move
                 pt = POINT()
-                try:
-                    user32.GetCursorPos(_ct.byref(pt))
-                    curr_x, curr_y = pt.x, pt.y
-                except Exception:
-                    curr_x, curr_y = cx, cy
-
-                dx = cx - curr_x
-                dy = cy - curr_y
-
+                user32.GetCursorPos(_ct.byref(pt))
+                dx, dy = cx - pt.x, cy - pt.y
                 if dx != 0 or dy != 0:
                     _send_input(_mouse_move_rel(dx, dy))
+
             elif t == "C":
                 btn_name = ev.get("btn", "left")
                 cx, cy = int(ev.get("x", 0)), int(ev.get("y", 0))
 
-                # ALWAYS use relative movement — never teleport with SetCursorPos
-                pt = POINT()
-                try:
-                    user32.GetCursorPos(_ct.byref(pt))
-                    curr_x, curr_y = pt.x, pt.y
-                except Exception:
-                    curr_x, curr_y = cx, cy
+                if ev.get("rel"):
+                    try:
+                        hwnd = user32.GetForegroundWindow()
+                        if hwnd:
+                            rect = RECT()
+                            if user32.GetWindowRect(hwnd, _ct.byref(rect)):
+                                cx += rect.left
+                                cy += rect.top
+                    except Exception:
+                        pass
 
-                dx = cx - curr_x
-                dy = cy - curr_y
-
-                if dx != 0 or dy != 0:
-                    _send_input(_mouse_move_rel(dx, dy))
+                # Use absolute positioning — bypasses mouse acceleration that
+                # would cause large relative moves to drift.
+                _send_input(_mouse_move(cx, cy))
+                time.sleep(0.01)
 
                 if "up" in ev:
                     up = ev.get("up", False)
@@ -5778,7 +5941,12 @@ h1{{font-size:30px}}
                 if rp:
                     try:
                         with open(rp, encoding="utf-8") as f:
-                            sub_evs = [e for e in json.load(f) if _valid_ev(e)]
+                            first_char = f.read(1)
+                            f.seek(0)
+                            if first_char == "#":
+                                sub_evs = _read_compact_run(rp)
+                            else:
+                                sub_evs = [e for e in json.load(f) if _valid_ev(e)]
                         self._replay_inline_events(sub_evs, depth + 1)
                     except Exception as e:
                         _LOG.warning("Run step failed: %s", e)
@@ -5874,6 +6042,9 @@ h1{{font-size:30px}}
                 pass
 
     def save_events(self):
+        if self.recording:
+            self.set_status("Stop recording first", _C["rec"], 1500)
+            return
         if not self.events:
             if RUNS_PATH.exists() and any(RUNS_PATH.glob("*.txt")):
                 self._open_run_picker()
@@ -5929,10 +6100,9 @@ h1{{font-size:30px}}
 
                 try:
                     with self._ev_lock:
-                        snap = _clean_events_for_save(self.events)
-                    with open(path, "w", encoding="utf-8") as f:
-                        json.dump(snap, f)
+                        _write_compact_run(self.events, str(path))
                     self.set_status("💾 Saved Run", _C["go"], 1500)
+                    self._log_message(f"> saved as {name}.txt")
                     threading.Thread(
                         target=self._webhook, args=("save",), daemon=True
                     ).start()
@@ -5975,9 +6145,29 @@ h1{{font-size:30px}}
     def _load_events(self, path):
         try:
             with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                self.events = [ev for ev in data if _valid_ev(ev)]
+                first_char = f.read(1)
+                f.seek(0)
+                if first_char == "#":
+                    self.events = _read_compact_run(path)
+                else:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self.events = [ev for ev in data if _valid_ev(ev)]
+            # Fix old recordings that have d=0 but _ts_perf timestamps
+            if (
+                self.events
+                and all(ev.get("d", 0) == 0 for ev in self.events)
+                and self.events[0].get("_ts_perf") is not None
+            ):
+                prev_ts = self.events[0].get("_ts_perf", 0)
+                self.events[0]["d"] = 0
+                for ev in self.events[1:]:
+                    cur = ev.get("_ts_perf", prev_ts)
+                    ev["d"] = max(0, int((cur - prev_ts) * 1000))
+                    prev_ts = cur
+            if self.events:
+                name = Path(path).stem
+                self._log_message(f"> loaded {name}")
         except FileNotFoundError:
             self.set_status("Run file not found!", _C["rec"], 3000)
             self.cfg.save_path = ""
@@ -5994,9 +6184,7 @@ h1{{font-size:30px}}
             name = datetime.now().strftime("run_%Y%m%d_%H%M%S.txt")
             path = RUNS_PATH / name
             with self._ev_lock:
-                snap = _clean_events_for_save(self.events)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(snap, f)
+                _write_compact_run(self.events, str(path))
             self.cfg.save_path = str(path)
             self.cfg.save()
             self.set_status("\U0001f4be Saved", _C["go"], 2500)
@@ -6135,6 +6323,23 @@ h1{{font-size:30px}}
         lb.config(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         lb.pack(side="left", fill="both", expand=True)
+
+        # Pen icon for rename-on-hover
+        rename_lbl = tk.Label(
+            lf,
+            text="\u270e",
+            bg=SACC_D,
+            fg=STEXT,
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
+            padx=5,
+            pady=1,
+        )
+        rename_edit = None
+        rename_idx = [-1]
+        _last_hover_idx = [-1]
+        _hide_after_id = [None]
+
         tk.Frame(inner, bg=SBORD, height=1).pack(fill="x", padx=8)
         bf = tk.Frame(inner, bg=SBG)
         bf.pack(fill="x", padx=8, pady=7)
@@ -6171,6 +6376,117 @@ h1{{font-size:30px}}
             )
 
         _redraw()
+
+        def _rename_hover(e):
+            if rename_edit is not None:
+                return
+            # Cancel any pending hide from leave
+            if _hide_after_id[0] is not None:
+                win.after_cancel(_hide_after_id[0])
+                _hide_after_id[0] = None
+            idx = lb.nearest(e.y)
+            if idx < 0 or idx >= len(runs):
+                _last_hover_idx[0] = -1
+                rename_lbl.place_forget()
+                return
+            if idx == _last_hover_idx[0]:
+                return
+            _last_hover_idx[0] = idx
+            bbox = lb.bbox(idx)
+            if bbox is None:
+                rename_lbl.place_forget()
+                return
+            x, y, w, h = bbox
+            rename_lbl.place(x=x + 118, y=y + 1, height=h - 2)
+            rename_idx[0] = idx
+
+        def _rename_leave(_e=None):
+            if rename_edit is not None:
+                return
+
+            # Delay hide so mouse can reach the pen icon
+            def _do_hide():
+                _hide_after_id[0] = None
+                rename_lbl.place_forget()
+
+            if _hide_after_id[0] is not None:
+                win.after_cancel(_hide_after_id[0])
+            _hide_after_id[0] = win.after(250, _do_hide)
+
+        def _start_rename(_e=None):
+            nonlocal rename_edit
+            idx = rename_idx[0]
+            if idx < 0 or idx >= len(runs):
+                return
+            rp = runs[idx]
+            rename_lbl.place_forget()
+            bbox = lb.bbox(idx)
+            if bbox is None:
+                return
+            bx, by, bw, bh = bbox
+            rename_edit = tk.Entry(
+                lf,
+                bg=SED,
+                fg=STEXT,
+                insertbackground=SACC,
+                font=("Consolas", 8),
+                relief="flat",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground=SACC,
+            )
+            rename_edit.insert(0, rp.stem)
+            rename_edit.selection_range(0, "end")
+            rename_edit.place(x=bx + 2, y=by + 1, width=bw - 4, height=bh - 2)
+            rename_edit.focus_set()
+
+            def _finish_rename(_e=None):
+                nonlocal rename_edit
+                if rename_edit is None:
+                    return
+                new_stem = rename_edit.get().strip()
+                rename_edit.destroy()
+                rename_edit = None
+                rename_lbl.place_forget()
+                if not new_stem or new_stem == rp.stem:
+                    return
+                safe = "".join(
+                    c for c in new_stem if c.isalnum() or c in " _-."
+                ).strip()
+                if not safe:
+                    self.set_status("Invalid name", _C["rec"], 1500)
+                    return
+                new_path = rp.parent / (safe + ".txt")
+                if new_path.exists() and new_path != rp:
+                    self.set_status("Name exists", _C["rec"], 1500)
+                    return
+                try:
+                    rp.rename(new_path)
+                    old_name = rp.name
+                    if old_name in favs:
+                        favs.discard(old_name)
+                        favs.add(new_path.name)
+                    _save_favs()
+                    _refresh_runs()
+                    try:
+                        new_idx = runs.index(new_path)
+                    except ValueError:
+                        new_idx = idx
+                    _redraw(new_idx)
+                    self.set_status("Renamed", _C["go"], 1500)
+                except Exception as ex:
+                    _LOG.warning("Rename run: %s", ex)
+                    self.set_status("Rename failed", _C["rec"], 1500)
+
+            rename_edit.bind("<Return>", _finish_rename)
+            rename_edit.bind("<Escape>", _finish_rename)
+            rename_edit.bind("<FocusOut>", _finish_rename)
+
+        rename_lbl.bind("<Button-1>", _start_rename)
+        rename_lbl.bind("<Enter>", lambda _e: rename_lbl.config(bg=SACC))
+        rename_lbl.bind("<Leave>", lambda _e: rename_lbl.config(bg=SACC_D))
+        lb.bind("<Motion>", _rename_hover, add="+")
+        lf.bind("<Leave>", _rename_leave, add="+")
 
         def _load():
             rp = _selected_run()
@@ -6892,8 +7208,8 @@ h1{{font-size:30px}}
             max_val, match_pt = self._find_best_match(
                 screen_bgr, template, roi_key=img_path
             )
-            # S-4 fix: use per-image threshold if configured, else 0.55
-            threshold = float(tgt.get("threshold", 0.55))
+            # S-4 fix: use per-image threshold if configured, else 0.90
+            threshold = float(tgt.get("threshold", 0.90))
             # S-6 fix: only unpack coordinates AFTER threshold check passes
             if max_val >= threshold:
                 match_x, match_y = match_pt
@@ -6941,6 +7257,12 @@ h1{{font-size:30px}}
 
                     # Three clicks spread around the image — AHK for Roblox compat
                     offsets = [(0, 0), (-4, -4), (4, -3)]
+                    self.root.after(
+                        0,
+                        lambda n=name, mx=match_x, my=match_y: self._log_message(
+                            f"> click {n} at {int(mx)},{int(my)}"
+                        ),
+                    )
                     for ox, oy in offsets:
                         _ahk_imgclick(int(match_x) + ox, int(match_y) + oy)
                         time.sleep(0.080)
@@ -7172,10 +7494,10 @@ h1{{font-size:30px}}
         with self._stats_lock:
             self.cfg.stats_run_count += 1
             self.cfg.stats_total_minutes += play_ms / 60000.0
-            try:
-                self.cfg.save()
-            except Exception:
-                pass
+        try:
+            self.cfg.save()
+        except Exception:
+            pass
         url = self.cfg.webhook_url.strip()
         if not url or not (
             (was_loop and self.cfg.wh_loop) or (not was_loop and self.cfg.wh_play)
@@ -7594,6 +7916,7 @@ h1{{font-size:30px}}
             ("Loop", "key_loop"),
             ("Save", "key_save"),
             ("Pause", "key_pause"),
+            ("Stop", "key_stop"),
         ]:
             _lbl(inn1, label)
             HotkeyEntry(
@@ -7619,7 +7942,7 @@ h1{{font-size:30px}}
         tk.Scale(
             inn1,
             from_=0.1,
-            to=5.0,
+            to=10.0,
             resolution=0.1,
             orient="horizontal",
             variable=speed_var,
@@ -7668,6 +7991,11 @@ h1{{font-size:30px}}
             "Always On Top (Main Window)",
             "always_on_top",
             lambda: self.root.attributes("-topmost", self.cfg.always_on_top),
+        )
+        _chk(
+            inn1,
+            "Record Relative To Window",
+            "record_relative_to_window",
         )
         tk.Frame(inn1, bg=SBG, height=10).pack()
 
@@ -8988,6 +9316,14 @@ _VK_MAP = {
     "scroll lock": 0x91,
     "print screen": 0x2C,
     "pause": 0x13,
+    "lcontrol": 0xA2,
+    "rcontrol": 0xA3,
+    "lshift": 0xA0,
+    "rshift": 0xA1,
+    "lalt": 0xA4,
+    "ralt": 0xA5,
+    "lwin": 0x5B,
+    "rwin": 0x5C,
 }
 for _c in range(ord("a"), ord("z") + 1):
     _VK_MAP[chr(_c)] = _c - 32
