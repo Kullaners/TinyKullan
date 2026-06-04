@@ -1077,8 +1077,21 @@ class _UIGrid:
     CW: int = 49  # column width
 
 
+# Standard layout grid parameters (Default/Tiny Mode)
+_STD_WW: int = 343  # Window Width
+_STD_TH: int = 28  # Title Bar Height
+_STD_BH: int = 54  # Button Row Height
+_STD_CW: int = 49  # Column Widget Width
+
+# BIG Mode layout grid parameters
+_BIG_WW: int = 490  # Expanded Window Width
+_BIG_TH: int = 28  # Title bar height (always matches STD — uniform across modes)
+_BIG_BH: int = 80  # Expanded Button Row Height
+_BIG_CW: int = 70  # Expanded Column Widget Width
+
 _UI = _UIGrid()
-WW, TH, BH, CW = _UI.WW, _UI.TH, _UI.BH, _UI.CW
+WW, TH, BH, CW = _STD_WW, _STD_TH, _STD_BH, _STD_CW
+BWW, BTH, BBH, BCW = _BIG_WW, _BIG_TH, _BIG_BH, _BIG_CW
 
 
 def _get_save_dir():
@@ -1428,6 +1441,7 @@ class Config:
         self.roblox_recovery_run: str = ""
         self.always_on_top: bool = False
         self.record_relative_to_window: bool = False
+        self.big_mode: bool = False
 
     @property
     def DEFAULTS(self):
@@ -1491,6 +1505,7 @@ class Config:
             "roblox_recovery_run": "",
             "always_on_top": False,
             "record_relative_to_window": False,
+            "big_mode": False,
         }
 
     def load(self):
@@ -1578,6 +1593,7 @@ class Config:
         self.auto_focus = b("UI", "AutoFocus", False)
         self.always_on_top = b("UI", "AlwaysOnTop", False)
         self.record_relative_to_window = b("UI", "RecordRelToWindow", False)
+        self.big_mode = b("UI", "BigMode", False)
         try:
             self.stats_total_minutes = float(g("Stats", "TotalMinutes", fallback="0"))
         except ValueError:
@@ -1651,6 +1667,7 @@ class Config:
             "AutoFocus": "1" if self.auto_focus else "0",
             "AlwaysOnTop": "1" if self.always_on_top else "0",
             "RecordRelToWindow": "1" if self.record_relative_to_window else "0",
+            "BigMode": "1" if self.big_mode else "0",
             **{
                 f"Tiny{k.capitalize()}": "1" if getattr(self, f"tiny_{k}") else "0"
                 for k in (
@@ -1723,10 +1740,15 @@ class Config:
 
 
 class Col:
-    def __init__(self, parent, idx, icon, label, cb):
+    def __init__(self, parent, idx, icon, label, cb, hotkey=""):
+        self.parent = parent
         self.cb = cb
+        self.hotkey = hotkey.upper() if hotkey else ""
+        self.active = False
+
+        # Base container setup
         self.frame = tk.Frame(parent, bg=_C["bg"], bd=0, highlightthickness=0)
-        self.frame.place(x=idx * CW, y=TH + 1, width=CW, height=BH)
+
         self.ico = tk.Label(
             self.frame,
             text=icon,
@@ -1736,7 +1758,7 @@ class Col:
             cursor="hand2",
             bd=0,
         )
-        self.ico.place(x=0, y=2, width=CW, height=30)
+
         self.lbl = tk.Label(
             self.frame,
             text=label,
@@ -1746,8 +1768,31 @@ class Col:
             cursor="hand2",
             bd=0,
         )
-        self.lbl.place(x=0, y=33, width=CW, height=13)
-        for w in (self.frame, self.ico, self.lbl):
+
+        # Hotkey indicator (Rendered exclusively in BIG Mode)
+        self.hk_lbl = tk.Label(
+            self.frame,
+            text=self.hotkey,
+            bg=_C["bg"],
+            fg=_C.get("lbl_fg", "#888"),
+            font=("Segoe UI", 6, "bold"),
+            cursor="hand2",
+            bd=0,
+        )
+
+        # Dual-state Activity Status Dot [Active] / [Inactive]
+        self.dot = tk.Label(
+            self.frame,
+            text="",
+            bg=_C["bg"],
+            fg="#22c55e",
+            font=("Segoe UI", 10),
+            cursor="hand2",
+            bd=0,
+        )
+
+        # Bubble-up click bindings across all structural elements
+        for w in (self.frame, self.ico, self.lbl, self.hk_lbl, self.dot):
             w.bind("<Button-1>", lambda _: self.cb())
             w.bind(
                 "<Enter>",
@@ -1758,20 +1803,66 @@ class Col:
             w.bind("<Leave>", lambda _: self._set_all_bg(_C["bg"]))
 
     def _set_all_bg(self, bg):
-        for w in (self.frame, self.ico, self.lbl):
-            w.config(bg=bg)
+        for w in (self.frame, self.ico, self.lbl, self.hk_lbl, self.dot):
+            if w.winfo_exists():
+                w.config(bg=bg)
 
-    def reposition(self, idx):
-        self.frame.place(x=idx * CW, y=TH + 1, width=CW, height=BH)
+    def reposition(self, idx, big=False):
+        """Dynamic structural morphing between Standard/Tiny and BIG modes."""
+        if big:
+            cw, th, bh = _BIG_CW, _BIG_TH, _BIG_BH
+            self.frame.place(x=idx * cw, y=th + 1, width=cw, height=bh)
+
+            # Icon: large, centered
+            self.ico.place(x=0, y=3, width=cw, height=38)
+            self.ico.config(font=("Segoe UI Emoji", 20))
+
+            # Label: bold 8pt
+            self.lbl.place(x=0, y=42, width=cw, height=14)
+            self.lbl.config(font=("Segoe UI", 8, "bold"))
+
+            # Hotkey: accent purple 7pt, shown below label
+            self.hk_lbl.place(x=0, y=57, width=cw, height=13)
+            self.hk_lbl.config(
+                font=("Segoe UI", 7, "bold"),
+                fg="#a38eff",
+                text=self.hotkey if self.hotkey else "NONE",
+            )
+
+            # Active dot: top-right corner of button cell
+            self.dot.place(x=cw - 14, y=3, width=10, height=10)
+            self.dot.config(font=("Segoe UI", 8))
+        else:
+            cw, th, bh = _STD_CW, _STD_TH, _STD_BH
+            self.frame.place(x=idx * cw, y=th + 1, width=cw, height=bh)
+            self.ico.place(x=0, y=2, width=cw, height=30)
+            self.ico.config(font=("Segoe UI Emoji", 14))
+            self.lbl.place(x=0, y=33, width=cw, height=13)
+            self.lbl.config(font=("Segoe UI", 6, "bold"))
+
+            # Remove hotkey and state dot labels from view in standard modes
+            self.hk_lbl.place_forget()
+            self.dot.place_forget()
+
+    def set_active(self, val):
+        self.active = val
+        self.dot.config(text="●" if val else "", fg="#22c55e" if val else _C["bg"])
+
+    def update_hotkey_text(self, new_hk):
+        self.hotkey = new_hk.upper() if new_hk else ""
+        if self.hk_lbl.winfo_exists():
+            self.hk_lbl.config(text=self.hotkey if self.hotkey else "NONE")
 
     def hide(self):
         self.frame.place_forget()
 
-    def show(self, idx):
-        self.reposition(idx)
+    def show(self, idx, big=False):
+        self.reposition(idx, big)
 
     def refresh(self):
         self._set_all_bg(_C["bg"])
+        self.ico.config(fg=_C["icon_fg"])
+        self.lbl.config(fg=_C["lbl_fg"])
         self.ico.config(fg=_C["icon_fg"])
         self.lbl.config(fg=_C["lbl_fg"])
 
@@ -2089,7 +2180,8 @@ class App:
         self.root.overrideredirect(True)
         self.root.configure(bg=_C["bg"])
         self.root.attributes("-topmost", self.cfg.always_on_top)
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.root.minsize(WW, TH + BH + 22)
         sw = self.root.winfo_screenwidth()
         self.root.geometry(f"{WW}x{TH + BH + 22}+{(sw - WW) // 2}+40")
         self.root._app_busy = lambda: (
@@ -2105,13 +2197,13 @@ class App:
         self._tb.place(x=0, y=0, width=WW, height=TH)
         self._ico = tk.Label(
             self._tb,
-            text="⬡",
+            text="✦",
             bg=_C["top"],
             fg=_C["title_fg"],
             font=("Segoe UI Symbol", 11, "bold"),
             bd=0,
         )
-        self._ico.place(x=7, y=4, width=20, height=20)
+        self._ico.place(x=7, y=5, width=20, height=20)
         self._title = tk.Label(
             self._tb,
             text="TinyKullan",
@@ -2122,7 +2214,7 @@ class App:
         )
         self._title.place(x=30, y=6)
         self._pill = tk.Frame(self._tb, bg=_C["pill"], bd=0)
-        self._pill.place(x=120, y=7, width=42, height=14)
+        self._pill.place(x=120, y=8, width=42, height=14)
         self._slbl = tk.Label(
             self._pill,
             text="Ready",
@@ -2131,7 +2223,8 @@ class App:
             font=("Segoe UI", 5, "bold"),
             bd=0,
         )
-        self._slbl.place(x=0, y=1, width=42, height=12)
+        self._slbl.place(x=0, y=2, width=42, height=12)
+
         self._btn_runs_top = tk.Label(
             self._tb,
             text="❇️",
@@ -2154,6 +2247,19 @@ class App:
             bd=0,
         )
         self._kv.pack(fill="both", expand=True)
+
+        # BIG mode toggle button
+        self._btn_big = tk.Label(
+            self._tb,
+            text="⬜",
+            bg=_C["top"],
+            fg=_C["title_fg"],
+            font=("Segoe UI Symbol", 10, "bold"),
+            cursor="hand2",
+            bd=0,
+        )
+        self._btn_big.place(x=WW - 90, y=0, width=22, height=TH)
+        self._btn_big.bind("<Button-1>", lambda _: self._toggle_big_mode())
 
         self._btn_draw = tk.Label(
             self._tb,
@@ -2195,13 +2301,13 @@ class App:
         self._sep.place(x=0, y=TH, width=WW)
         tk.Frame(self.root, bg=_C["bg"], bd=0).place(x=0, y=TH + 1, width=WW, height=BH)
 
-        # ── Log bar ─────────────────────────────────────
+        # Tiny mode: single-line log bar
         self._log_f = tk.Frame(self.root, bg=_C["pill"], bd=0)
         self._log_f.place(x=0, y=TH + BH + 2, width=WW, height=20)
         self._log_lbl = tk.Label(
             self._log_f,
             bg=_C["pill"],
-            fg="#ffffff",
+            fg="#fff",
             font=("Segoe UI", 7),
             anchor="w",
             padx=6,
@@ -2209,24 +2315,47 @@ class App:
         )
         self._log_lbl.pack(side="left", fill="both", expand=True)
         self._log_after = None
+        self._loop_warn_active = False
 
-        self._loop_warn = tk.Label(
-            self._log_f,
-            bg=_C["pill"],
-            fg="#ff4444",
-            font=("Segoe UI", 7),
-            padx=6,
-            text="esc = stop",
-        )
-        # hidden until toggle_loop places it
+        # Per-button active/inactive status labels (BIG mode only)
+        self._status_row_frame = tk.Frame(self.root, bg=_C["top"], height=18)
+        self._col_status_labels = {}
 
         self.c_rec = Col(
-            self.root, 0, self.cfg.ico_record, "Record", self.toggle_record
+            self.root,
+            0,
+            self.cfg.ico_record,
+            "Record",
+            self.toggle_record,
+            hotkey=self.cfg.key_record,
         )
-        self.c_play = Col(self.root, 1, self.cfg.ico_play, "Play", self.toggle_play)
-        self.c_loop = Col(self.root, 2, self.cfg.ico_loop, "Loop", self.toggle_loop)
-        self.c_save = Col(self.root, 3, self.cfg.ico_save, "Save", self.save_events)
-        self.c_pause = Col(self.root, 4, "⏸", "Pause", self._toggle_pause)
+        self.c_play = Col(
+            self.root,
+            1,
+            self.cfg.ico_play,
+            "Play",
+            self.toggle_play,
+            hotkey=self.cfg.key_play,
+        )
+        self.c_loop = Col(
+            self.root,
+            2,
+            self.cfg.ico_loop,
+            "Loop",
+            self.toggle_loop,
+            hotkey=self.cfg.key_loop,
+        )
+        self.c_save = Col(
+            self.root,
+            3,
+            self.cfg.ico_save,
+            "Save",
+            self.save_events,
+            hotkey=self.cfg.key_save,
+        )
+        self.c_pause = Col(
+            self.root, 4, "⏸", "Pause", self._toggle_pause, hotkey=self.cfg.key_pause
+        )
         self.c_edit = Col(self.root, 5, "✏", "Edit", self._open_macro_editor)
         self.c_set = Col(
             self.root, 6, self.cfg.ico_settings, "Settings", self._open_settings
@@ -2242,7 +2371,21 @@ class App:
             ("settings", self.c_set),
         ]
 
+        # Create status labels for BIG mode status row
+        for name, col in self._all_cols:
+            lbl = tk.Label(
+                self._status_row_frame,
+                text="[unactive]",
+                bg=_C["top"],
+                fg="#ef4444",
+                font=("Segoe UI", 7, "bold"),
+                anchor="center",
+            )
+            self._col_status_labels[name] = lbl
+
         self._apply_tiny()
+        if self.cfg.big_mode:
+            self.root.after(50, self._apply_big)
 
         for w in (self._tb, self._ico, self._title, self._pill, self._slbl):
             w.bind("<ButtonPress-1>", self._drag_start)
@@ -2267,11 +2410,171 @@ class App:
         self.load_image_detection()
         threading.Thread(target=self._image_search_worker, daemon=True).start()
 
+    def _toggle_big_mode(self):
+        self.cfg.big_mode = not self.cfg.big_mode
+        self._apply_big()
+
+    def _apply_big(self):
+        """Toggle between BIG and standard mode.
+        Title bar stays EXACTLY the same size in all modes.
+        Only the button row, status row, and log panel expand."""
+        big = self.cfg.big_mode
+
+        # Button row uses BIG or STD column widths/heights
+        cw = _BIG_CW if big else _STD_CW
+        bh = _BIG_BH if big else _STD_BH
+        # Title bar ALWAYS standard height
+        th = _STD_TH
+
+        # -- Toggle button icon --
+        self._btn_big.config(
+            text="▣" if big else "⬜",
+            fg="#7c5cfc" if big else _C["title_fg"],
+        )
+
+        # -- Determine visible columns --
+        if not self.cfg.tiny_mode:
+            visible_cols = [col for _, col in self._all_cols]
+            visible_names = [name for name, _ in self._all_cols]
+        else:
+            toggle_map = {
+                "record": self.cfg.tiny_record,
+                "play": self.cfg.tiny_play,
+                "loop": self.cfg.tiny_loop,
+                "save": self.cfg.tiny_save,
+                "pause": self.cfg.tiny_pause,
+                "edit": self.cfg.tiny_edit,
+                "settings": True,
+            }
+            visible_pairs = [
+                (n, c) for n, c in self._all_cols if toggle_map.get(n, True)
+            ]
+            if len(visible_pairs) < 3:
+                visible_pairs = [
+                    p for p in self._all_cols if p[0] in ("record", "play", "settings")
+                ]
+            visible_cols = [c for _, c in visible_pairs]
+            visible_names = [n for n, _ in visible_pairs]
+
+        n_cols = len(visible_cols)
+
+        # -- Window geometry --
+        STATUS_H = 18
+        LOG_H = 72
+        if big:
+            calc_w = n_cols * cw
+            calc_h = th + bh + STATUS_H + LOG_H + 4
+        else:
+            calc_w = n_cols * cw
+            calc_h = th + bh + 22
+
+        geo = self.root.geometry()
+        parts = geo.split("+")
+        pos_x = parts[1] if len(parts) > 1 else "100"
+        pos_y = parts[2] if len(parts) > 2 else "100"
+        self.root.geometry(f"{calc_w}x{calc_h}+{pos_x}+{pos_y}")
+
+        # -- Resize title bar (always std height) --
+        self._tb.place_configure(width=calc_w, height=th)
+        self._sep.place_configure(width=calc_w, y=th)
+
+        # -- Reposition window controls (22px, standard size) --
+        self._btn_close.place_configure(x=calc_w - 24, y=0, width=22, height=th)
+        self._btn_min.place_configure(x=calc_w - 46, y=0, width=22, height=th)
+        self._btn_draw.place_configure(x=calc_w - 68, y=0, width=22, height=th)
+        self._btn_big.place_configure(x=calc_w - 90, y=0, width=22, height=th)
+
+        # Title bar elements — always standard tiny sizes, just repositioned
+        self._ico.place_configure(x=7, y=4, width=20, height=20)
+        self._ico.config(font=("Segoe UI Symbol", 11, "bold"))
+        self._title.place_configure(x=30, y=6)
+        self._title.config(font=("Segoe UI", 8, "bold"))
+        self._pill.place_configure(
+            x=120, y=7, width=42, height=14, relx=0.0, anchor="nw"
+        )
+        self._slbl.place_configure(x=0, y=1, width=42, height=12)
+        self._slbl.config(font=("Segoe UI", 5, "bold"))
+        self._btn_runs_top.place_configure(x=164, y=4, width=18, height=18)
+        self._kv_f.place_configure(x=185, y=7, relx=0.0, anchor="nw")
+
+        # -- Column buttons --
+        hidden_ids = set(id(c) for c in visible_cols)
+        for _, col in self._all_cols:
+            if id(col) not in hidden_ids:
+                col.hide()
+
+        for idx, col in enumerate(visible_cols):
+            col.show(idx, big=big)
+            if col is self.c_rec:
+                col.set_active(self.recording)
+            elif col is self.c_play:
+                col.set_active(self.playing or self.looping)
+            elif col is self.c_pause:
+                col.set_active(self._pause_playback)
+            else:
+                col.set_active(False)
+
+        # -- BIG mode extra rows --
+        if big:
+            self._status_row_frame.place(
+                x=0, y=th + bh + 1, width=calc_w, height=STATUS_H
+            )
+            self._status_row_frame.config(bg=_C["top"])
+
+            for i, name in enumerate(visible_names):
+                lbl = self._col_status_labels.get(name)
+                if lbl:
+                    lbl.place(x=i * cw, y=0, width=cw, height=STATUS_H)
+                    lbl.config(bg=_C["top"])
+            for name in [n for n, _ in self._all_cols]:
+                if name not in visible_names:
+                    lbl = self._col_status_labels.get(name)
+                    if lbl:
+                        lbl.place_forget()
+
+            self._update_status_row()
+
+            # BIG mode log: simple text widget, no frame/decorations
+            log_y = th + bh + STATUS_H + 2
+            if (
+                not hasattr(self, "_log_text_panel")
+                or not self._log_text_panel.winfo_exists()
+            ):
+                self._log_text_panel = tk.Text(
+                    self.root,
+                    bg="#0a0614",
+                    fg="#00ffff",
+                    font=("Consolas", 8),
+                    bd=0,
+                    highlightthickness=0,
+                    wrap="word",
+                    state="disabled",
+                    height=5,
+                )
+            self._log_text_panel.place(x=2, y=log_y, width=calc_w - 4, height=72)
+            self._log_f.place_forget()
+
+        else:
+            self._status_row_frame.place_forget()
+            if hasattr(self, "_log_text_panel") and self._log_text_panel.winfo_exists():
+                self._log_text_panel.place_forget()
+            self._log_f.place(x=0, y=th + bh + 2, width=calc_w, height=20)
+
+        self.root.update_idletasks()
+        if sys.platform == "win32" and hasattr(self, "_hwnd"):
+            _round_hwnd(self._hwnd)
+
     def _apply_tiny(self):
         visible = []
         if not self.cfg.tiny_mode:
+            # Restore pill/slbl to standard bounds regardless of big_mode
+            self._pill.place_configure(
+                x=120, y=8, width=42, height=14, relx=0.0, anchor="nw"
+            )
+            self._slbl.place_configure(x=0, y=2, width=42, height=12)
+            self._slbl.config(font=("Segoe UI", 5, "bold"))
             for i, (_, col) in enumerate(self._all_cols):
-                col.show(i)
+                col.show(i, big=self.cfg.big_mode)
             new_w = len(self._all_cols) * CW
             hide_ctrls = False
         else:
@@ -2305,13 +2608,15 @@ class App:
                 if id(col) not in visible_set:
                     col.hide()
             for i, col in enumerate(visible):
-                col.show(i)
+                col.show(i, big=self.cfg.big_mode)
             new_w = max(len(visible) * CW, 3 * CW)
             hide_ctrls = False  # Always show min/close/draw controls
 
         cur = self.root.geometry().split("+")
         x, y = (cur[1] if len(cur) > 1 else "0"), (cur[2] if len(cur) > 2 else "40")
-        self.root.geometry(f"{new_w}x{TH + BH + 22}+{x}+{y}")
+        # Use proper height: BIG mode lets _apply_big override, else standard
+        use_h = TH + BH + 22
+        self.root.geometry(f"{new_w}x{use_h}+{x}+{y}")
         self._tb.place_configure(width=new_w)
         self._sep.place_configure(width=new_w)
 
@@ -2358,6 +2663,28 @@ class App:
                 self._pill.place_configure(x=120, y=7, relx=0.0, anchor="nw")
                 self._btn_runs_top.place_configure(x=164, y=4)
                 self._kv_f.place_configure(x=185, y=7, relx=0.0, anchor="nw")
+
+        # Let _build_gui handle the initial _apply_big call
+
+    def _update_status_row(self):
+        """Refresh the [active]/[unactive] labels under each button in BIG mode."""
+        if not self.cfg.big_mode:
+            return
+        states = {
+            "record": self.recording,
+            "play": self.playing and not self.looping,
+            "loop": self.looping,
+            "save": False,
+            "pause": self._pause_playback,
+            "edit": False,
+            "settings": False,
+        }
+        for name, lbl in self._col_status_labels.items():
+            active = states.get(name, False)
+            lbl.config(
+                text="[active]" if active else "[unactive]",
+                fg="#22c55e" if active else "#ef4444",
+            )
 
     def _get_alpha(self):
         return self.cfg.alpha_focused if self._focused else self.cfg.alpha_unfocused
@@ -3041,13 +3368,44 @@ class App:
             )
 
     def _log_message(self, text):
-        """Show a single log line in the bar, auto-clears after 2.5s."""
+        """Log a line. Tiny: 1 line + warning if looping. BIG: max 5 lines, warning at bottom."""
         if not hasattr(self, "_log_lbl"):
             return
-        self._log_lbl.config(text=text)
-        if self._log_after is not None:
-            self.root.after_cancel(self._log_after)
-        self._log_after = self.root.after(2500, lambda: self._log_lbl.config(text=""))
+        stop_key = self.cfg.key_stop or "esc"
+        # Tiny/standard mode
+        if hasattr(self, "_log_lbl") and self._log_lbl.winfo_exists():
+            if self._loop_warn_active:
+                self._log_lbl.config(text=f"{text}  |  {stop_key} = stop")
+            else:
+                self._log_lbl.config(text=text)
+            if self._log_after is not None:
+                self.root.after_cancel(self._log_after)
+            if not self._loop_warn_active:
+                self._log_after = self.root.after(
+                    2500, lambda: self._log_lbl.config(text="")
+                )
+        # BIG mode
+        if hasattr(self, "_log_text_panel") and self._log_text_panel.winfo_exists():
+            try:
+                self._log_text_panel.config(state="normal")
+                # Remove old warning if present (last non-empty line starting with "> esc" etc)
+                end = self._log_text_panel.index("end-1c")
+                last_line = self._log_text_panel.get("end-2l", "end-1c").strip()
+                if self._loop_warn_active and ("= stop" in last_line):
+                    self._log_text_panel.delete("end-2l", "end-1c")
+                # Append new log
+                self._log_text_panel.insert("end", text + "\n")
+                # Append warning if looping
+                if self._loop_warn_active:
+                    self._log_text_panel.insert("end", f"> {stop_key} = stop\n")
+                # Trim to 5 lines
+                count = int(self._log_text_panel.index("end-1c").split(".")[0])
+                if count > 5:
+                    self._log_text_panel.delete("1.0", f"{count - 5}.0")
+                self._log_text_panel.see("end")
+                self._log_text_panel.config(state="disabled")
+            except Exception:
+                pass
 
     def _update_kv(self, text):
         if self._kv_after is not None:
@@ -3279,6 +3637,16 @@ class App:
 
     def _register_hotkeys(self):
         self._build_hk_vks()
+        self.update_application_hotkey_manifest()
+
+    def update_application_hotkey_manifest(self):
+        """Call this anytime hotkeys are updated to refresh the button hints instantly."""
+        if hasattr(self, "c_rec"):
+            self.c_rec.update_hotkey_text(self.cfg.key_record)
+            self.c_play.update_hotkey_text(self.cfg.key_play)
+            self.c_loop.update_hotkey_text(self.cfg.key_loop)
+            self.c_save.update_hotkey_text(self.cfg.key_save)
+            self.c_pause.update_hotkey_text(self.cfg.key_pause)
 
     def _global_on_press(self, key):
         vk, scan, ext = _key_to_vk(key)
@@ -3313,17 +3681,48 @@ class App:
                     all_held = True
                     for svk in self._stop_key_vks:
                         if svk in (0x10, 0xA0, 0xA1):
-                            if not ((user32.GetAsyncKeyState(0x10) | user32.GetAsyncKeyState(0xA0) | user32.GetAsyncKeyState(0xA1)) & 0x8000):
-                                all_held = False; break
+                            if not (
+                                (
+                                    user32.GetAsyncKeyState(0x10)
+                                    | user32.GetAsyncKeyState(0xA0)
+                                    | user32.GetAsyncKeyState(0xA1)
+                                )
+                                & 0x8000
+                            ):
+                                all_held = False
+                                break
                         elif svk in (0x11, 0xA2, 0xA3):
-                            if not ((user32.GetAsyncKeyState(0x11) | user32.GetAsyncKeyState(0xA2) | user32.GetAsyncKeyState(0xA3)) & 0x8000):
-                                all_held = False; break
+                            if not (
+                                (
+                                    user32.GetAsyncKeyState(0x11)
+                                    | user32.GetAsyncKeyState(0xA2)
+                                    | user32.GetAsyncKeyState(0xA3)
+                                )
+                                & 0x8000
+                            ):
+                                all_held = False
+                                break
                         elif svk in (0x12, 0xA4, 0xA5):
-                            if not ((user32.GetAsyncKeyState(0x12) | user32.GetAsyncKeyState(0xA4) | user32.GetAsyncKeyState(0xA5)) & 0x8000):
-                                all_held = False; break
+                            if not (
+                                (
+                                    user32.GetAsyncKeyState(0x12)
+                                    | user32.GetAsyncKeyState(0xA4)
+                                    | user32.GetAsyncKeyState(0xA5)
+                                )
+                                & 0x8000
+                            ):
+                                all_held = False
+                                break
                         elif svk in (0x5B, 0x5C):
-                            if not ((user32.GetAsyncKeyState(0x5B) | user32.GetAsyncKeyState(0x5C)) & 0x8000):
-                                all_held = False; break
+                            if not (
+                                (
+                                    user32.GetAsyncKeyState(0x5B)
+                                    | user32.GetAsyncKeyState(0x5C)
+                                )
+                                & 0x8000
+                            ):
+                                all_held = False
+                                break
                         elif svk not in self._currently_pressed_vks:
                             all_held = False
                             break
@@ -3507,6 +3906,8 @@ class App:
             return
         self.events = []
         self.recording = True
+        self.c_rec.set_active(True)
+        self.root.after(0, self._update_status_row)
         with self._click_lock:
             self._clicked_this_run = set()
         if self.temp_image_det_list:
@@ -3611,6 +4012,8 @@ class App:
             except Exception:
                 pass
 
+        self.c_rec.set_active(False)
+        self.root.after(0, self._update_status_row)
         self.c_rec.ico.config(text=self.cfg.ico_record)
         self.c_rec.lbl.config(text="Record")
         self.root.after(0, self._reset_ui)
@@ -3699,6 +4102,8 @@ class App:
         with self._click_lock:
             self._clicked_this_run = set()
         self.playing = True
+        self.c_play.set_active(True)
+        self.root.after(0, self._update_status_row)
         self._stop_ev.clear()
         self.c_play.ico.config(text="⏹")
         self.c_play.lbl.config(text="Stop")
@@ -3718,13 +4123,15 @@ class App:
         with self._click_lock:
             self._clicked_this_run = set()
         self.playing = self.looping = True
+        self.c_loop.set_active(True)
+        self.root.after(0, self._update_status_row)
         self._stop_ev.clear()
         self.c_loop.ico.config(text="⏹")
         self.c_loop.lbl.config(text="Stop")
         self.set_status("\u221e LOOP", _C["loop"])
+        self._loop_warn_active = True
         stop_key = self.cfg.key_stop or "esc"
-        self._loop_warn.config(text=f"{stop_key} = stop")
-        self._loop_warn.place(relx=1.0, rely=0.5, anchor="e", x=-50)
+        self._log_message(f"> {stop_key} = stop")
         self._anim_tick()
 
         # Start AHK playback process with looping in background thread
@@ -3782,6 +4189,7 @@ class App:
                 pass
 
         self.root.after(0, self._reset_ui)
+        self.root.after(0, self._update_status_row)
         self.set_status("Stopped", None, 1500)
 
     def _toggle_pause(self):
@@ -3796,6 +4204,10 @@ class App:
 
     def _reset_ui(self):
         self._currently_pressed_vks.clear()
+        self.c_rec.set_active(False)
+        self.c_play.set_active(False)
+        self.c_loop.set_active(False)
+        self.root.after(0, self._update_status_row)
         # Reset icon colours from animation
         self.c_rec.ico.config(fg=_C["icon_fg"])
         self.c_play.ico.config(fg=_C["icon_fg"])
@@ -3809,9 +4221,7 @@ class App:
         self.c_pause.ico.config(text="\u23f8")
         self.c_pause.lbl.config(text="Pause")
         self._pause_playback = False
-        if hasattr(self, "_loop_warn"):
-            self._loop_warn.place_forget()
-            self._loop_warn.config(text="")
+        self._loop_warn_active = False
 
     def _ahk_playback_worker(self, loop):
         t0 = time.perf_counter()
@@ -3899,6 +4309,7 @@ class App:
             if self._stop_ev.is_set() or not loop:
                 _finish()
                 return
+            self._log_message(f"> looped {iteration[0]}x")
             self.root.after(
                 0,
                 lambda: self.set_status(
@@ -7302,6 +7713,7 @@ h1{{font-size:30px}}
         self._stop_ev.set()
         self.running_all_images = False
         self.root.after(0, self._reset_ui)
+        self.root.after(0, self._update_status_row)
         self.set_status("Stopped", None, 1500)
 
     def _run_all_images_worker(self):
@@ -7996,6 +8408,12 @@ h1{{font-size:30px}}
             inn1,
             "Record Relative To Window",
             "record_relative_to_window",
+        )
+        _chk(
+            inn1,
+            "BIG Mode",
+            "big_mode",
+            callback=self._apply_big,
         )
         tk.Frame(inn1, bg=SBG, height=10).pack()
 
