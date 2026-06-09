@@ -25,6 +25,7 @@ Global StopPath := ""
 Global WindowsMouseHook := 0
 Global SpeedMultiplier := 1.0
 Global LastPressTimes := Map()  ; filter OS auto-repeat keys during recording
+Global LastClickTimes := Map()    ; filter OS auto-repeat mouse clicks during recording
 
 ; Command line argument parsing
 Global ImgClickX := 0
@@ -264,9 +265,14 @@ LowLevelMouseProc(nCode, wParam, lParam) {
 }
 
 RecordClick(btn, state) {
-    Global Recording, Events, StartTime
+    Global Recording, Events, StartTime, LastClickTimes
     if (!Recording)
         Return
+    ; Filter OS auto-repeat mouse clicks (same as keyboard debounce)
+    now := QPC()
+    if LastClickTimes.Has(btn) && (now - LastClickTimes[btn]) < 30
+        Return
+    LastClickTimes[btn] := now
     delay := Round(QPC() - StartTime)
     pt := Buffer(8, 0)
     DllCall("GetCursorPos", "Ptr", pt)
@@ -310,12 +316,14 @@ OnKeyPress(ih, vk, sc, extended := 0) {
 }
 
 OnKeyRelease(ih, vk, sc, extended := 0) {
-    Global Recording, Events, StartTime
+    Global Recording, Events, StartTime, LastPressTimes
     if (!Recording)
         Return
     if (vk = 0x74 || vk = 0x75 || vk = 0x77)
         Return
     delay := Round(QPC() - StartTime)
+    if (LastPressTimes.Has(vk))
+        LastPressTimes.Delete(vk)
     Events.Push({t: "K", d: delay, vk: vk, sc: sc, ext: extended, s: "Up"})
 }
 
@@ -651,8 +659,17 @@ QPC() {
 
 ; Emergency unlock — press Esc to release ALL stuck modifiers
 ~Esc:: {
-    if (Playing || Recording)
-        return  ; let normal Esc pass through during playback/recording
+    if (Playing) {
+        StopPlayback()
+        return
+    }
+    if (Recording) {
+        StopRecording()
+        SaveMacroFile(MacroPath)
+        ExitApp()
+        return
+    }
+    ; Idle: Esc does nothing special — passes through freely
 }
 ^Esc::EmergencyRelease()
 +Esc::EmergencyRelease()
@@ -674,8 +691,9 @@ F6::TogglePlay()
 ~*MButton Up::RecordClick("middle", "Up")
 
 ; Wheel recording (Bug 8 fix)
-~*WheelUp::RecordWheel(120)
-~*WheelDown::RecordWheel(-120)
+; A_EventInfo returns notch count (1 per notch); SendInput expects WHEEL_DELTA (120 per notch)
+~*WheelUp::RecordWheel(A_EventInfo ? A_EventInfo * 120 : 120)
+~*WheelDown::RecordWheel(A_EventInfo ? -A_EventInfo * 120 : -120)
 
 RecordWheel(delta) {
     Global Recording, Events, StartTime

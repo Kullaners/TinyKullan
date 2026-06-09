@@ -720,8 +720,11 @@ def _read_compact_run(filepath):
             if typ in ("MOVE", "REL_MOVE"):
                 rel = typ.startswith("REL_")
                 if len(parts) >= 3 and "," in parts[2]:
-                    xy = parts[2].split(",")
-                    x, y = int(xy[0]), int(xy[1])
+                    try:
+                        xy = parts[2].split(",")
+                        x, y = int(xy[0]), int(xy[1])
+                    except (ValueError, IndexError):
+                        continue
                     ev = {"t": "M", "d": d, "x": x, "y": y}
                     if rel:
                         ev["rel"] = True
@@ -731,8 +734,11 @@ def _read_compact_run(filepath):
                 rel = typ.startswith("REL_")
                 up = typ.endswith("_UP") or typ == "MOUSE_UP" or typ == "REL_MOUSE_UP"
                 if len(parts) >= 3 and "," in parts[2]:
-                    xy = parts[2].split(",")
-                    x, y = int(xy[0]), int(xy[1])
+                    try:
+                        xy = parts[2].split(",")
+                        x, y = int(xy[0]), int(xy[1])
+                    except (ValueError, IndexError):
+                        continue
                     btn = parts[3] if len(parts) >= 4 else "left"
                     ev = {"t": "C", "d": d, "btn": btn, "up": up, "x": x, "y": y}
                     if rel:
@@ -757,11 +763,17 @@ def _read_compact_run(filepath):
                 events.append({"t": "K", "d": d, "vk": vk, "scan": scan, "up": up})
 
             elif typ == "SCROLL":
-                delta = int(parts[2]) if len(parts) >= 3 else 0
+                try:
+                    delta = int(parts[2]) if len(parts) >= 3 else 0
+                except ValueError:
+                    delta = 0
                 events.append({"t": "W", "d": d, "delta": delta})
 
             elif typ == "SCROLL_H":
-                delta = int(parts[2]) if len(parts) >= 3 else 0
+                try:
+                    delta = int(parts[2]) if len(parts) >= 3 else 0
+                except ValueError:
+                    delta = 0
                 events.append({"t": "WH", "d": d, "delta": delta})
 
             elif typ == "IMAGE":
@@ -773,7 +785,10 @@ def _read_compact_run(filepath):
 
             elif typ == "BRANCH":
                 name = urllib.parse.unquote(parts[2]) if len(parts) >= 3 else ""
-                skip = int(parts[3]) if len(parts) >= 4 else 1
+                try:
+                    skip = int(parts[3]) if len(parts) >= 4 else 1
+                except ValueError:
+                    skip = 1
                 events.append(
                     {"t": "B", "d": d, "name": name, "img": name, "skip": skip}
                 )
@@ -1111,7 +1126,7 @@ RUNS_PATH = BASE_SAVE_PATH / "Saves" / "runs"
 RUN_FAV_PATH = BASE_SAVE_PATH / "Saves" / "run_favorites.json"
 IMAGE_DET_JSON = BASE_SAVE_PATH / "Saves" / "image_detection.json"
 IMAGES_PATH = BASE_SAVE_PATH / "Saves" / "images"
-SHOT_PATH = BASE_SAVE_PATH / "Assets" / "ScreenShots"
+SHOT_PATH = Path(r"C:\TinyKullan\Assets\ScreenShots")
 _log_path = BASE_SAVE_PATH / "Saves" / "tinykullan.log"
 try:
     _log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1234,7 +1249,9 @@ def _set_alpha(hwnd, alpha):
 
 
 def _get_hwnd(wid):
-    return _ct.windll.user32.GetParent(wid)
+    GA_ROOT = 2
+    hwnd = _ct.windll.user32.GetAncestor(wid, GA_ROOT)
+    return hwnd or wid
 
 
 def _make_single_desktop_app_window(hwnd):
@@ -1347,15 +1364,18 @@ def _ms():
 
 
 def _grab_screen(mss_instance=None):
-    """M-2 fix: accepts optional persistent mss instance for reuse."""
-    if mss_instance is not None:
-        monitor = mss_instance.monitors[0]
-        img = mss_instance.grab(monitor)
-        return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
-    with _mss.mss() as sct:
-        monitor = sct.monitors[0]
-        img = sct.grab(monitor)
-        return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
+    """M-2 fix: accepts optional persistent mss instance for reuse. Falls back to ImageGrab."""
+    try:
+        if mss_instance is not None:
+            monitor = mss_instance.monitors[0]
+            img = mss_instance.grab(monitor)
+            return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
+        with _mss.mss() as sct:
+            monitor = sct.monitors[0]
+            img = sct.grab(monitor)
+            return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
+    except Exception:
+        return ImageGrab.grab()
 
 
 def _valid_ev(ev):
@@ -1389,12 +1409,12 @@ class Config:
         self.key_pause: str = "f9"
         self.key_stop: str = "esc"
         self.save_path: str = ""
-        self.shot_folder: str = str(SHOT_PATH)
+        self.shot_folder: str = r"C:\TinyKullan\Assets\ScreenShots"
         self.webhook_url: str = ""
         self.mention_id: str = ""
         self.wh_record: bool = True
         self.wh_play: bool = True
-        self.wh_loop: bool = False
+        self.wh_loop: bool = True
         self.wh_save: bool = False
         self.wh_screenshot: bool = True
         self.img_det_enabled: bool = True
@@ -1454,12 +1474,12 @@ class Config:
             "key_pause": "f9",
             "key_stop": "esc",
             "save_path": "",
-            "shot_folder": str(SHOT_PATH),
+            "shot_folder": r"C:\TinyKullan\Assets\ScreenShots",
             "webhook_url": "",
             "mention_id": "",
             "wh_record": True,
             "wh_play": True,
-            "wh_loop": False,
+            "wh_loop": True,
             "wh_save": False,
             "wh_screenshot": True,
             "img_det_enabled": True,
@@ -1532,7 +1552,7 @@ class Config:
         self.key_pause = g("Hotkeys", "Pause", fallback=self.key_pause)
         self.key_stop = g("Hotkeys", "Stop", fallback=self.key_stop)
         self.save_path = g("UI", "SavePath", fallback="")
-        self.shot_folder = g("UI", "ShotFolder", fallback=self.shot_folder)
+        self.shot_folder = g("UI", "ShotFolder", fallback=self.shot_folder) or self.shot_folder
         for attr, section, key, cast in [
             ("speed", "UI", "Speed", float),
             ("alpha_focused", "UI", "AlphaFocused", int),
@@ -1548,7 +1568,7 @@ class Config:
         self.mention_id = g("Webhook", "MentionID", fallback="")
         self.wh_record = b("Webhook", "OnRecord", True)
         self.wh_play = b("Webhook", "OnPlay", True)
-        self.wh_loop = b("Webhook", "OnLoop", False)
+        self.wh_loop = b("Webhook", "OnLoop", True)
         self.wh_save = b("Webhook", "OnSave", False)
         self.wh_screenshot = b("Webhook", "Screenshot", True)
         self.img_det_enabled = b("ImageDetection", "Enabled", True)
@@ -2091,7 +2111,6 @@ class App:
         self._img_cache_lock = (
             threading.Lock()
         )  # S-1: protects image_det_list reads (template cache uses @lru_cache)
-        self._recovering = False
         self._recover_lock = (
             threading.Lock()
         )  # C-2: protects _recovering state transitions
@@ -2595,9 +2614,7 @@ class App:
                 # Auto-enable record, play, settings as fallback minimum set
                 forced = {"record", "play", "settings"}
                 for name in forced:
-                    setattr(
-                        self.cfg, f"tiny_{'delete' if name == 'pause' else name}", True
-                    )
+                    setattr(self.cfg, f"tiny_{name}", True)
                 visible = [
                     col
                     for name, col in self._all_cols
@@ -3060,8 +3077,8 @@ class App:
                         self._current_line = []
                         self._draw_last_pos = None
 
-            except Exception as e:
-                pass
+            except Exception:
+                _LOG.debug("Draw loop error", exc_info=True)
 
         # Loop at high frequency (10ms) to ensure smooth lines
         self.root.after(10, self._draw_loop)
@@ -3476,7 +3493,7 @@ class App:
         try:
             self.cfg.save()
         except Exception:
-            pass
+            _LOG.exception("Failed to save config on quit")
         self._remove_tray()
         self._stop_recording()
         self._stop_ev.set()
@@ -3487,7 +3504,7 @@ class App:
             try:
                 self._ahk_proc.terminate()
             except Exception:
-                pass
+                _LOG.exception("Failed to terminate AHK playback process")
             self._ahk_proc = None
         # Terminate AHK persistent worker if active
         global _ahk_worker_proc
@@ -3495,40 +3512,60 @@ class App:
             try:
                 _ahk_worker_proc.terminate()
             except Exception:
-                pass
+                _LOG.exception("Failed to terminate AHK worker process")
             _ahk_worker_proc = None
         # Release ALL held keys — prevent stuck modifiers
         try:
             self._release_held()
         except Exception:
-            pass
-        # Emergency key release: brute-force all modifier VKs
+            _LOG.exception("Failed to release held keys on quit")
+        # Emergency key release: brute-force all modifier and action VKs
+        # Must match TinyKullan.ahk ReleaseAllHeld() to prevent stuck keys
         _EMERGENCY_VKS = (
             0x10,
             0x11,
             0x12,
             0x5B,
-            0x5C,  # Shift, Ctrl, Alt, Win L/R
+            0x5C,  # Shift, Ctrl, Alt, LWin, RWin
             0xA0,
             0xA1,
             0xA2,
             0xA3,
             0xA4,
             0xA5,  # L/R variants
-            0x1B,
-            0x20,
-            0x0D,
-            0x09,
-            0x08,
-            0x2E,  # Esc, Space, Enter, Tab, BS, Del
-            0x25,
-            0x26,
-            0x27,
-            0x28,  # Arrow keys
             0x57,
             0x41,
             0x53,
             0x44,  # WASD
+            0x25,
+            0x26,
+            0x27,
+            0x28,  # Arrows
+            0x20,
+            0x0D,
+            0x1B,
+            0x09,  # Space, Enter, Esc, Tab
+            0x51,
+            0x45,
+            0x52,
+            0x46,  # Q, E, R, F
+            0x08,
+            0x2E,
+            0x14,  # BS, Del, Caps
+            0x70,
+            0x71,
+            0x72,
+            0x73,
+            0x74,
+            0x75,
+            0x76,
+            0x77,  # F1-F8
+            0x21,
+            0x22,
+            0x23,
+            0x24,
+            0x2D,
+            0x2E,  # PgUp, PgDn, End, Home, Ins, Del
         )
         for vk in _EMERGENCY_VKS:
             try:
@@ -4180,6 +4217,39 @@ class App:
             0xA3,
             0xA4,
             0xA5,  # L/R variants
+            0x57,
+            0x41,
+            0x53,
+            0x44,  # WASD
+            0x25,
+            0x26,
+            0x27,
+            0x28,  # Arrows
+            0x20,
+            0x0D,
+            0x1B,
+            0x09,  # Space, Enter, Esc, Tab
+            0x51,
+            0x45,
+            0x52,
+            0x46,  # Q, E, R, F
+            0x08,
+            0x2E,
+            0x14,  # BS, Del, Caps
+            0x70,
+            0x71,
+            0x72,
+            0x73,
+            0x74,
+            0x75,
+            0x76,
+            0x77,  # F1-F8
+            0x21,
+            0x22,
+            0x23,
+            0x24,
+            0x2D,
+            0x2E,  # PgUp, PgDn, End, Home, Ins, Del
         )
         for vk in _EMERGENCY_VKS:
             try:
@@ -4203,7 +4273,8 @@ class App:
         self.set_status(label, _C["loop"])
 
     def _reset_ui(self):
-        self._currently_pressed_vks.clear()
+        with self._held_lock:
+            self._currently_pressed_vks.clear()
         self.c_rec.set_active(False)
         self.c_play.set_active(False)
         self.c_loop.set_active(False)
@@ -4316,6 +4387,11 @@ class App:
                     f"\u221e {iteration[0]}  |  esc = stop", _C["loop"]
                 ),
             )
+            # Send webhook with screenshot+embed after each loop iteration
+            if self.cfg.wh_loop:
+                threading.Thread(
+                    target=self._post_play, args=(0, True, True), daemon=True
+                ).start()
             # Schedule next iteration via main loop
             self.root.after(50, _spawn)
 
@@ -6434,7 +6510,7 @@ h1{{font-size:30px}}
                 scan = user32.MapVirtualKeyW(vk, 0) if vk else 0
                 _send_input(_make_key(vk, scan, True, vk in _EXTENDED_VKS))
             except Exception:
-                pass
+                _LOG.debug("Release held key vk=%s failed", vk, exc_info=True)
         with self._held_lock:
             self._held_vks.clear()
             self._held_keys.clear()
@@ -6442,7 +6518,7 @@ h1{{font-size:30px}}
             try:
                 _send_input(_mouse_button(btn_name, True))
             except Exception:
-                pass
+                _LOG.debug("Release held btn %s failed", btn_name, exc_info=True)
         with self._held_lock:
             self._held_btns.clear()
         # Safety: release all modifier keys
@@ -6450,7 +6526,7 @@ h1{{font-size:30px}}
             try:
                 _send_input(_make_key(vk, 0, True, vk in _EXTENDED_VKS))
             except Exception:
-                pass
+                _LOG.debug("Release modifier vk=%s failed", vk, exc_info=True)
 
     def save_events(self):
         if self.recording:
@@ -7900,16 +7976,17 @@ h1{{font-size:30px}}
         except Exception as e:
             _LOG.warning("Webhook: %s", e)
 
-    def _post_play(self, play_ms, was_loop):
+    def _post_play(self, play_ms, was_loop, skip_stats=False):
         self._run_count += 1
         # S-9 fix: lock-protected stats increment and save
-        with self._stats_lock:
-            self.cfg.stats_run_count += 1
-            self.cfg.stats_total_minutes += play_ms / 60000.0
-        try:
-            self.cfg.save()
-        except Exception:
-            pass
+        if not skip_stats:
+            with self._stats_lock:
+                self.cfg.stats_run_count += 1
+                self.cfg.stats_total_minutes += play_ms / 60000.0
+            try:
+                self.cfg.save()
+            except Exception:
+                pass
         url = self.cfg.webhook_url.strip()
         if not url or not (
             (was_loop and self.cfg.wh_loop) or (not was_loop and self.cfg.wh_play)
