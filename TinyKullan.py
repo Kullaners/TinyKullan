@@ -197,6 +197,7 @@ if sys.platform == "win32":
     WMAPP_NOTIFYCALLBACK = 0x8001
     MF_STRING = 0x00000000
     MF_SEPARATOR = 0x00000800
+    MF_POPUP = 0x00000010
     TPM_RIGHTBUTTON = 0x00000002
     TPM_RETURNCMD = 0x00000100
 
@@ -683,11 +684,6 @@ def _write_compact_run(events, filepath):
                 action = ev.get("action", "click")
                 f.write(f"IMAGE|{d}|{name}|{action}\n")
 
-            elif t == "B":
-                name = urllib.parse.quote(ev.get("name", ""), safe="")
-                skip = ev.get("skip", 1)
-                f.write(f"BRANCH|{d}|{name}|{skip}\n")
-
             elif t == "R":
                 name = urllib.parse.quote(ev.get("name", ""), safe="")
                 f.write(f"RUN|{d}|{name}\n")
@@ -781,16 +777,6 @@ def _read_compact_run(filepath):
                 action = parts[3] if len(parts) >= 4 else "click"
                 events.append(
                     {"t": "I", "d": d, "name": name, "img": name, "action": action}
-                )
-
-            elif typ == "BRANCH":
-                name = urllib.parse.unquote(parts[2]) if len(parts) >= 3 else ""
-                try:
-                    skip = int(parts[3]) if len(parts) >= 4 else 1
-                except ValueError:
-                    skip = 1
-                events.append(
-                    {"t": "B", "d": d, "name": name, "img": name, "skip": skip}
                 )
 
             elif typ == "RUN":
@@ -1382,7 +1368,7 @@ def _valid_ev(ev):
     if not (isinstance(ev, dict) and "d" in ev):
         return False
     t = ev.get("t", "")
-    if t not in ("M", "C", "K", "W", "WH", "I", "R", "D", "B"):
+    if t not in ("M", "C", "K", "W", "WH", "I", "R", "D"):
         return False
     if t == "M" and ("x" not in ev or "y" not in ev):
         return False
@@ -1462,6 +1448,8 @@ class Config:
         self.always_on_top: bool = False
         self.record_relative_to_window: bool = False
         self.big_mode: bool = False
+        self.close_minimizes: bool = True
+        self.recorder_overlay: bool = True
 
     @property
     def DEFAULTS(self):
@@ -1526,6 +1514,8 @@ class Config:
             "always_on_top": False,
             "record_relative_to_window": False,
             "big_mode": False,
+            "close_minimizes": True,
+            "recorder_overlay": True,
         }
 
     def load(self):
@@ -1552,7 +1542,9 @@ class Config:
         self.key_pause = g("Hotkeys", "Pause", fallback=self.key_pause)
         self.key_stop = g("Hotkeys", "Stop", fallback=self.key_stop)
         self.save_path = g("UI", "SavePath", fallback="")
-        self.shot_folder = g("UI", "ShotFolder", fallback=self.shot_folder) or self.shot_folder
+        self.shot_folder = (
+            g("UI", "ShotFolder", fallback=self.shot_folder) or self.shot_folder
+        )
         for attr, section, key, cast in [
             ("speed", "UI", "Speed", float),
             ("alpha_focused", "UI", "AlphaFocused", int),
@@ -1614,6 +1606,8 @@ class Config:
         self.always_on_top = b("UI", "AlwaysOnTop", False)
         self.record_relative_to_window = b("UI", "RecordRelToWindow", False)
         self.big_mode = b("UI", "BigMode", False)
+        self.close_minimizes = b("UI", "CloseMinimizes", True)
+        self.recorder_overlay = b("UI", "RecorderOverlay", True)
         try:
             self.stats_total_minutes = float(g("Stats", "TotalMinutes", fallback="0"))
         except ValueError:
@@ -1688,6 +1682,8 @@ class Config:
             "AlwaysOnTop": "1" if self.always_on_top else "0",
             "RecordRelToWindow": "1" if self.record_relative_to_window else "0",
             "BigMode": "1" if self.big_mode else "0",
+            "CloseMinimizes": "1" if self.close_minimizes else "0",
+            "RecorderOverlay": "1" if self.recorder_overlay else "0",
             **{
                 f"Tiny{k.capitalize()}": "1" if getattr(self, f"tiny_{k}") else "0"
                 for k in (
@@ -2314,7 +2310,10 @@ class App:
             bd=0,
         )
         self._btn_close.place(x=WW - 24, y=0, width=22, height=TH)
-        self._btn_close.bind("<Button-1>", lambda _: self._quit())
+        self._btn_close.bind(
+            "<Button-1>",
+            lambda _: self._minimize() if self.cfg.close_minimizes else self._quit(),
+        )
 
         self._sep = tk.Frame(self.root, bg=_C["sep"], height=1, bd=0)
         self._sep.place(x=0, y=TH, width=WW)
@@ -2917,6 +2916,27 @@ class App:
         _ct.windll.user32.AppendMenuW(menu, MF_STRING, 1003, play_label)
         _ct.windll.user32.AppendMenuW(menu, MF_STRING, 1005, pause_label)
         _ct.windll.user32.AppendMenuW(menu, MF_STRING, 1008, "Edit")
+
+        # Recent macros submenu
+        _ct.windll.user32.AppendMenuW(menu, MF_SEPARATOR, 0, 0)
+        recent = []
+        try:
+            recent = sorted(
+                [p for p in RUNS_PATH.glob("*.txt") if p.is_file()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:5]
+        except Exception:
+            pass
+        if recent:
+            sub = _ct.windll.user32.CreatePopupMenu()
+            for i, rp in enumerate(recent):
+                label = rp.stem
+                if len(label) > 35:
+                    label = label[:32] + "..."
+                _ct.windll.user32.AppendMenuW(sub, MF_STRING, 1201 + i, label)
+            _ct.windll.user32.AppendMenuW(menu, MF_POPUP, sub, "Recent Macros")
+
         _ct.windll.user32.AppendMenuW(menu, MF_SEPARATOR, 0, 0)
         _ct.windll.user32.AppendMenuW(menu, MF_STRING, 1099, "Exit")
         pt = POINT()
@@ -2943,6 +2963,21 @@ class App:
             self.root.after(100, self._open_macro_editor)
         elif cmd == 1099:
             self.root.after(0, self._quit)
+        elif 1201 <= cmd <= 1205:
+            self._restore_from_tray()
+            try:
+                recent = sorted(
+                    [p for p in RUNS_PATH.glob("*.txt") if p.is_file()],
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                idx = cmd - 1201
+                if idx < len(recent):
+                    self.root.after(
+                        200, lambda p=str(recent[idx]): self._load_events(p)
+                    )
+            except Exception:
+                pass
 
     def _restore_from_tray(self):
         self._sleeping = False
@@ -3490,6 +3525,7 @@ class App:
             self._blink_after = self.root.after(180, self._anim_tick)
 
     def _quit(self):
+        self._stop_recorder_overlay()
         try:
             self.cfg.save()
         except Exception:
@@ -3987,6 +4023,11 @@ class App:
                 [ahk_path, ahk_script, "/record", macro_temp],
                 creationflags=0x08000000 if sys.platform == "win32" else 0,
             )
+
+            # Start recorder overlay if enabled
+            if self.cfg.recorder_overlay:
+                self._start_recorder_overlay()
+
         except FileNotFoundError as e:
             _LOG.error("AHK not found: %s", e)
             self.set_status("AHK not installed - run install.bat", _C["rec"], 4000)
@@ -4003,6 +4044,7 @@ class App:
     def _stop_recording(self):
         if not self.recording:
             return
+        self._stop_recorder_overlay()
         if self._blink_after is not None:
             self.root.after_cancel(self._blink_after)
             self._blink_after = None
@@ -4058,6 +4100,79 @@ class App:
         self._log_message(f"> recorded {len(self.events)} events")
         threading.Thread(target=self._webhook, args=("record",), daemon=True).start()
         self._auto_save_run()
+
+    def _start_recorder_overlay(self):
+        """Create a tiny transparent overlay that follows the cursor during recording."""
+        if getattr(self, "_overlay_win", None):
+            return
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#000000")
+        win.wm_attributes("-transparentcolor", "#000000")
+        try:
+            hwnd = _get_hwnd(win.winfo_id())
+            style = _ct.windll.user32.GetWindowLongW(hwnd, -20)
+            _ct.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
+            _ct.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 200, 0x02)
+        except Exception:
+            pass
+        lbl = tk.Label(
+            win,
+            text="\u25cf REC",
+            bg="#000000",
+            fg="#ef4444",
+            font=("Segoe UI", 11, "bold"),
+            bd=0,
+        )
+        lbl.pack(padx=8, pady=4)
+        key_lbl = tk.Label(
+            win,
+            text="",
+            bg="#000000",
+            fg="#f59e0b",
+            font=("Segoe UI", 8),
+            bd=0,
+        )
+        key_lbl.pack(padx=8, pady=(0, 4))
+        self._overlay_win = win
+        self._overlay_key_lbl = key_lbl
+        self._overlay_last_key = ""
+        self._overlay_key_time = 0
+        self._overlay_after_id = None
+        self._update_overlay_pos()
+
+    def _update_overlay_pos(self):
+        if not getattr(self, "_overlay_win", None):
+            return
+        try:
+            pt = POINT()
+            user32.GetCursorPos(_ct.byref(pt))
+            self._overlay_win.geometry(f"+{pt.x + 16}+{pt.y + 16}")
+            now = time.time()
+            if self._overlay_last_key and now - self._overlay_key_time > 1.0:
+                self._overlay_key_lbl.config(text="")
+                self._overlay_last_key = ""
+        except Exception:
+            pass
+        if self.recording:
+            self._overlay_after_id = self.root.after(50, self._update_overlay_pos)
+
+    def _stop_recorder_overlay(self):
+        if getattr(self, "_overlay_after_id", None):
+            try:
+                self.root.after_cancel(self._overlay_after_id)
+            except Exception:
+                pass
+            self._overlay_after_id = None
+        win = getattr(self, "_overlay_win", None)
+        if win:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._overlay_win = None
+            self._overlay_key_lbl = None
 
     def _dt(self):
         now = _ms()
@@ -4128,6 +4243,11 @@ class App:
                 else str(key).replace("'", "")[:2]
             )
             self.root.after(0, self._maybe_update_kv, txt)
+            # Flash key on recorder overlay
+            if getattr(self, "_overlay_win", None) and self.recording:
+                self._overlay_key_lbl.config(text=txt.upper())
+                self._overlay_last_key = txt
+                self._overlay_key_time = time.time()
 
     def _on_key_release(self, key):
         pass
@@ -5318,6 +5438,31 @@ h1{{font-size:30px}}
         hold_var = tk.BooleanVar(value=False)
         hold_chk_ref = [None]
 
+        # B-event specific: hold toggle, open-image button
+        _b_hold_var = tk.BooleanVar(value=False)
+        _b_hold_chk = tk.Checkbutton(
+            fields_frame,
+            text="Hold key",
+            variable=_b_hold_var,
+            bg=SSURF,
+            fg=SMUTED,
+            selectcolor=SSURF,
+            activebackground=SSURF,
+            activeforeground=STEXT,
+            font=("Segoe UI", 7),
+            cursor="hand2",
+        )
+
+        def _on_b_hold_toggle():
+            if _b_hold_var.get():
+                field_vars["d"][0].set("100")
+                field_vars["d"][2].config(text="Hold (ms)")
+                field_vars["d"][1].pack(fill="x", pady=2)
+            else:
+                field_vars["d"][1].pack_forget()
+
+        _b_hold_var.trace_add("write", lambda *_: _on_b_hold_toggle())
+
         for label_text, key in field_labels:
             row = tk.Frame(fields_frame, bg=SSURF)
             row.pack(fill="x", pady=2)
@@ -5333,11 +5478,11 @@ h1{{font-size:30px}}
             lbl_w.pack(side="left")
             var = tk.StringVar()
             if key == "action":
-                # Dropdown: valid image search action types
+                # Dropdown: valid action types for image and if-image events
                 ent = ttk.Combobox(
                     row,
                     textvariable=var,
-                    values=["click", "none"],
+                    values=["click", "none", "key", "delay", "run"],
                     state="readonly",
                     font=("Consolas", 8),
                     width=10,
@@ -5478,6 +5623,28 @@ h1{{font-size:30px}}
             if key != "x" and key != "y":
                 ent.pack(side="left", fill="x", expand=True)
             field_vars[key] = (var, row, lbl_w)
+
+        # Action trace: toggle sub-fields for B event actions
+        def _on_action_change(*_args):
+            if not getattr(_on_action_change, "_is_b_event", False):
+                return
+            act = field_vars["action"][0].get()
+            # Hide all B-specific sub-fields first
+            field_vars["key"][1].pack_forget()
+            field_vars["d"][1].pack_forget()
+            _b_hold_chk.pack_forget()
+            if act == "key":
+                field_vars["key"][1].pack(fill="x", pady=2)
+                _b_hold_chk.pack(fill="x", pady=2)
+                if _b_hold_var.get():
+                    field_vars["d"][2].config(text="Hold (ms)")
+                    field_vars["d"][1].pack(fill="x", pady=2)
+            elif act == "delay":
+                field_vars["d"][2].config(text="Delay (ms)")
+                field_vars["d"][1].pack(fill="x", pady=2)
+            # Don't touch name combo here — _show_fields_for handles it
+
+        field_vars["action"][0].trace_add("write", _on_action_change)
 
         # Image Source Selector for 'I' events (Current Imgs vs Folder)
         custom_folder_path = [""]
@@ -5653,8 +5820,6 @@ h1{{font-size:30px}}
                 return f"{i + 1:04d}  {d:>5}ms  {custom_lbl}Scroll {axis} delta={ev.get('delta', 0)}"
             elif t == "I":
                 return f"{i + 1:04d}  {custom_lbl}Image {ev.get('name') or ev.get('img', '?')}"
-            elif t == "B":
-                return f"{i + 1:04d}  {custom_lbl}If {ev.get('name') or ev.get('img', '?')} else skip {ev.get('skip', 1)}"
             elif t == "R":
                 return f"{i + 1:04d}  {custom_lbl}Run {ev.get('name', '?')}"
             elif t == "D":
@@ -5729,6 +5894,12 @@ h1{{font-size:30px}}
         def _show_fields_for(ev):
             """Show/hide fields based on event type and populate values."""
             t = ev.get("t", "M")
+            _on_action_change._is_b_event = False
+            # Hide all B-specific elements
+            _b_hold_chk.pack_forget()
+            # Reset labels
+            field_vars["x"][2].config(text="X")
+            field_vars["y"][2].config(text="Y")
             # Hide all first
             for key, (var, row, lbl) in field_vars.items():
                 row.pack_forget()
@@ -5786,14 +5957,6 @@ h1{{font-size:30px}}
                     stored_action if stored_action in ("click", "none") else "click"
                 )
                 field_vars["action"][1].pack(fill="x", pady=2)
-            if t == "B":
-                field_vars["name"][0].set(ev.get("name") or ev.get("img", ""))
-                img_source_frame.pack(fill="x", pady=2)
-                _update_image_source(img_source_var.get())
-                field_vars["name"][1].pack(fill="x", pady=2)
-                field_vars["d"][0].set(str(ev.get("skip", 1)))
-                field_vars["d"][1].pack(fill="x", pady=2)
-                field_vars["d"][2].config(text="Skip N")
             if t == "R":
                 field_vars["name"][0].set(ev.get("name", ""))
                 # Populate the name dropdown with saved macro run names
@@ -5819,7 +5982,6 @@ h1{{font-size:30px}}
                     "W": "Vertical scroll",
                     "WH": "Horizontal scroll",
                     "I": "Image step. Name can be image target name or image filename.",
-                    "B": "If image found → continue, else → skip N events below.",
                     "R": "Run step. Name can be saved run name or filename.",
                     "D": "Wait-only delay step.",
                 }.get(t, "")
@@ -5944,15 +6106,7 @@ h1{{font-size:30px}}
                         action = field_vars["action"][0].get().strip().lower()
                         if action in ("click", "none", "image", "run"):
                             ev["action"] = action
-                    if t == "B":
-                        name = field_vars["name"][0].get().strip()
-                        if name:
-                            ev["name"] = name
-                            ev["img"] = name
-                        try:
-                            ev["skip"] = max(1, int(field_vars["d"][0].get()))
-                        except ValueError:
-                            ev["skip"] = 1
+
                     if t == "R":
                         name = field_vars["name"][0].get().strip()
                         if name:
@@ -6070,56 +6224,256 @@ h1{{font-size:30px}}
             _refresh_list(select=pos)
 
         def _add_run():
-            name = ""
+            # Open a picker so the user can choose which saved run to embed
             try:
                 runs = sorted(
                     RUNS_PATH.glob("*.txt"),
                     key=lambda p: p.stat().st_mtime,
                     reverse=True,
                 )
-                if runs:
-                    name = runs[0].stem
             except Exception:
-                pass
+                runs = []
+
+            if not runs:
+                self.set_status("No saved runs found", _C["rec"], 1500)
+                return
+
+            # Simple Listbox picker
+            picker = tk.Toplevel(ed)
+            picker.configure(bg=SBG)
+            picker.overrideredirect(True)
+            picker.attributes("-topmost", True)
+            N = min(len(runs), 12)
+            PW, PH = 340, 30 + N * 24
+            px = ed.winfo_x() + (ed.winfo_width() - PW) // 2
+            py = ed.winfo_y() + (ed.winfo_height() - PH) // 2
+            picker.geometry(f"{PW}x{PH}+{max(0, px)}+{max(0, py)}")
+            tb2 = tk.Frame(picker, bg=SSURF, height=26)
+            tb2.pack(fill="x")
+            tk.Label(
+                tb2,
+                text="  Select a saved run",
+                bg=SSURF,
+                fg=STEXT,
+                font=("Segoe UI", 8, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=6)
+            xb2 = tk.Label(
+                tb2,
+                text="\u2715",
+                bg=SSURF,
+                fg=SMUTED,
+                font=("Segoe UI", 9),
+                cursor="hand2",
+                width=3,
+            )
+            xb2.pack(side="right")
+            xb2.bind("<Button-1>", lambda _: picker.destroy())
+            tk.Frame(picker, bg=SBORD, height=1).pack(fill="x")
+            lb_list = tk.Listbox(
+                picker,
+                bg=SSURF,
+                fg=STEXT,
+                selectbackground=SACC,
+                selectforeground=SBG,
+                font=("Segoe UI", 8),
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                activestyle="none",
+            )
+            lb_list.pack(fill="both", expand=True, padx=2, pady=2)
+            run_names = []
+            for rp in runs:
+                kb = rp.stat().st_size / 1024.0
+                ts = datetime.fromtimestamp(rp.stat().st_mtime).strftime("%m/%d %H:%M")
+                lb_list.insert("end", f"  {rp.stem}     ({kb:.1f} KB, {ts})")
+                run_names.append(rp.stem)
+            chosen = [None]
+
+            def _ok():
+                sel = lb_list.curselection()
+                if sel:
+                    chosen[0] = run_names[sel[0]]
+                picker.destroy()
+
+            lb_list.bind("<Double-Button-1>", lambda _: _ok())
+            lb_list.bind("<Return>", lambda _: _ok())
+            btn_f2 = tk.Frame(picker, bg=SBG)
+            btn_f2.pack(fill="x", padx=6, pady=(0, 6))
+            ok_btn = tk.Label(
+                btn_f2,
+                text="  OK  ",
+                bg=SACC_D,
+                fg=STEXT,
+                font=("Segoe UI", 8, "bold"),
+                cursor="hand2",
+                padx=8,
+                pady=2,
+            )
+            ok_btn.pack(side="right")
+            ok_btn.bind("<Button-1>", lambda _: _ok())
+            dx2, dy2 = [0], [0]
+            tb2.bind(
+                "<ButtonPress-1>",
+                lambda e: (dx2.__setitem__(0, e.x), dy2.__setitem__(0, e.y)),
+            )
+            tb2.bind(
+                "<B1-Motion>",
+                lambda e: picker.geometry(
+                    f"+{picker.winfo_x() + e.x - dx2[0]}+{picker.winfo_y() + e.y - dy2[0]}"
+                ),
+            )
+            picker.grab_set()
+            ed.wait_window(picker)
+            if not chosen[0]:
+                return
             save_state()
             with self._ev_lock:
                 pos = len(self.events)
-                self.events.append({"t": "R", "name": name})
+                self.events.append({"t": "R", "name": chosen[0]})
             _refresh_list(select=pos)
 
-        def _add_image():
-            name = ""
+        def _pick_image_name(prompt):
+            """Show a Listbox picker with all available image names
+            (detection list + IMAGES_PATH folder). Returns name or None."""
+            names = []
+            for item in self.image_det_list:
+                n = item.get("name") or Path(item.get("path", "")).stem
+                if n and n not in names:
+                    names.append(n)
             try:
-                if self.image_det_list:
-                    name = (
-                        self.image_det_list[0].get("name")
-                        or Path(self.image_det_list[0].get("path", "")).name
-                    )
+                if IMAGES_PATH.exists():
+                    for p in IMAGES_PATH.glob("*"):
+                        if p.is_file() and p.suffix.lower() in (
+                            ".png",
+                            ".jpg",
+                            ".jpeg",
+                            ".bmp",
+                            ".webp",
+                        ):
+                            if p.name not in names:
+                                names.append(p.name)
             except Exception:
                 pass
+            if custom_folder_path[0]:
+                try:
+                    fp = Path(custom_folder_path[0])
+                    if fp.exists():
+                        for p in fp.glob("*"):
+                            if p.is_file() and p.suffix.lower() in (
+                                ".png",
+                                ".jpg",
+                                ".jpeg",
+                                ".bmp",
+                                ".webp",
+                            ):
+                                if p.name not in names:
+                                    names.append(p.name)
+                except Exception:
+                    pass
+            if not names:
+                self.set_status(
+                    "No images found. Add images in Settings > Detection",
+                    _C["rec"],
+                    2500,
+                )
+                return None
+            picker = tk.Toplevel(ed)
+            picker.configure(bg=SBG)
+            picker.overrideredirect(True)
+            picker.attributes("-topmost", True)
+            N = min(len(names), 14)
+            PW, PH = 280, 30 + N * 24
+            px = ed.winfo_x() + (ed.winfo_width() - PW) // 2
+            py = ed.winfo_y() + (ed.winfo_height() - PH) // 2
+            picker.geometry(f"{PW}x{PH}+{max(0, px)}+{max(0, py)}")
+            tb3 = tk.Frame(picker, bg=SSURF, height=26)
+            tb3.pack(fill="x")
+            tk.Label(
+                tb3,
+                text=f"  {prompt}",
+                bg=SSURF,
+                fg=STEXT,
+                font=("Segoe UI", 8, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=6)
+            xb3 = tk.Label(
+                tb3,
+                text="\u2715",
+                bg=SSURF,
+                fg=SMUTED,
+                font=("Segoe UI", 9),
+                cursor="hand2",
+                width=3,
+            )
+            xb3.pack(side="right")
+            xb3.bind("<Button-1>", lambda _: picker.destroy())
+            tk.Frame(picker, bg=SBORD, height=1).pack(fill="x")
+            lb3 = tk.Listbox(
+                picker,
+                bg=SSURF,
+                fg=STEXT,
+                selectbackground=SACC,
+                selectforeground=SBG,
+                font=("Segoe UI", 8),
+                relief="flat",
+                bd=0,
+                highlightthickness=0,
+                activestyle="none",
+            )
+            lb3.pack(fill="both", expand=True, padx=2, pady=2)
+            for n in names:
+                lb3.insert("end", f"  {n}")
+            chosen = [None]
+
+            def _conf():
+                sel = lb3.curselection()
+                if sel:
+                    chosen[0] = names[sel[0]]
+                picker.destroy()
+
+            lb3.bind("<Double-Button-1>", lambda _: _conf())
+            lb3.bind("<Return>", lambda _: _conf())
+            bf = tk.Frame(picker, bg=SBG)
+            bf.pack(fill="x", padx=6, pady=(0, 6))
+            ok = tk.Label(
+                bf,
+                text="  OK  ",
+                bg=SACC_D,
+                fg=STEXT,
+                font=("Segoe UI", 8, "bold"),
+                cursor="hand2",
+                padx=8,
+                pady=2,
+            )
+            ok.pack(side="right")
+            ok.bind("<Button-1>", lambda _: _conf())
+            dx3, dy3 = [0], [0]
+            tb3.bind(
+                "<ButtonPress-1>",
+                lambda e: (dx3.__setitem__(0, e.x), dy3.__setitem__(0, e.y)),
+            )
+            tb3.bind(
+                "<B1-Motion>",
+                lambda e: picker.geometry(
+                    f"+{picker.winfo_x() + e.x - dx3[0]}+{picker.winfo_y() + e.y - dy3[0]}"
+                ),
+            )
+            picker.grab_set()
+            ed.wait_window(picker)
+            return chosen[0]
+
+        def _add_image():
+            name = _pick_image_name("Select Image")
+            if not name:
+                return
             save_state()
             with self._ev_lock:
                 pos = len(self.events)
                 self.events.append(
                     {"t": "I", "name": name, "img": name, "action": "click"}
                 )
-            _refresh_list(select=pos)
-
-        def _add_if_image():
-            """Add a conditional branch: if image found → continue, else → skip N events."""
-            name = ""
-            try:
-                if self.image_det_list:
-                    name = (
-                        self.image_det_list[0].get("name")
-                        or Path(self.image_det_list[0].get("path", "")).name
-                    )
-            except Exception:
-                pass
-            save_state()
-            with self._ev_lock:
-                pos = len(self.events)
-                self.events.append({"t": "B", "name": name, "img": name, "skip": 1})
             _refresh_list(select=pos)
 
         def _make_btn(parent, text, cmd, bg=SBORD, fg=SMUTED, bold=False):
@@ -6194,8 +6548,7 @@ h1{{font-size:30px}}
         row3 = tk.Frame(quick_add_frame, bg=SSURF)
         row3.pack(fill="x", pady=2)
         _make_btn(row3, "+ Run", _add_run).pack(side="left", padx=(0, 4))
-        _make_btn(row3, "+ Image", _add_image).pack(side="left", padx=(0, 4))
-        _make_btn(row3, "+ If", _add_if_image).pack(side="left")
+        _make_btn(row3, "+ Image", _add_image).pack(side="left")
 
         # Footer
         foot = tk.Frame(panel, bg=SSURF)
@@ -6208,6 +6561,88 @@ h1{{font-size:30px}}
             fg=STEXT,
             bold=True,
         ).pack(fill="x")
+        _make_btn(
+            foot,
+            "  Export .ahk  ",
+            _do_export_ahk,
+            bg=SBORD,
+            fg=SMUTED,
+        ).pack(fill="x", pady=(4, 0))
+
+        def _do_export_ahk():
+            """Export current events as a standalone AutoHotkey script."""
+            if not self.events:
+                self.set_status("No events to export", _C["rec"], 1500)
+                return
+            # Ask where to save
+            path = filedialog.asksaveasfilename(
+                parent=ed,
+                title="Export as AutoHotkey Script",
+                defaultextension=".ahk",
+                filetypes=[("AutoHotkey Script", "*.ahk")],
+                initialfile="macro_export.ahk",
+            )
+            if not path:
+                return
+            try:
+                lines = [
+                    "#Requires AutoHotkey v2.0",
+                    "#SingleInstance Force",
+                    'SendMode "Input"',
+                    'CoordMode "Mouse", "Screen"',
+                    "",
+                    "; Generated by TinyKullan",
+                    f"; {len(self.events)} events",
+                    "",
+                    "Esc::ExitApp",
+                    "",
+                ]
+                for ev in self.events:
+                    t = ev.get("t", "")
+                    d = ev.get("d", 0)
+                    if t == "M":
+                        lines.append(f"MouseMove {ev.get('x', 0)}, {ev.get('y', 0)}, 0")
+                    elif t == "C":
+                        btn = ev.get("btn", "left")
+                        lines.append(
+                            f'MouseClick "{btn}", {ev.get("x", 0)}, {ev.get("y", 0)}, 1, 0'
+                        )
+                    elif t == "K":
+                        vk = ev.get("vk", 0)
+                        key_name = _vk_to_compact_name(vk)
+                        if key_name:
+                            up = ev.get("up", False)
+                            if up:
+                                lines.append(f"Send '{{{key_name} up}}'")
+                            else:
+                                d_ms = max(d, 50)
+                                if d_ms < 100:
+                                    lines.append(f"Send '{{{key_name}}}'")
+                                else:
+                                    lines.append(f"Send '{{{key_name} down}}'")
+                                    lines.append(f"Sleep {d_ms}")
+                                    lines.append(f"Send '{{{key_name} up}}'")
+                    elif t == "W":
+                        delta = ev.get("delta", 120)
+                        direction = "WheelUp" if delta > 0 else "WheelDown"
+                        lines.append(f"Send '{{{direction}}}'")
+                    elif t == "D":
+                        lines.append(f"Sleep {max(1, d)}")
+                    elif t == "R":
+                        name = ev.get("name", "")
+                        lines.append(f"; Run sub-macro: {name}")
+                        lines.append(
+                            f"; NOTE: Sub-macros require TinyKullan to resolve"
+                        )
+                    if d > 0 and t not in ("K", "D"):
+                        lines.append(f"Sleep {max(1, d)}")
+                lines.append("")
+                lines.append('MsgBox "Macro finished."')
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                self.set_status(f"Exported to {Path(path).name}", _C["go"], 2000)
+            except Exception as e:
+                self.set_status(f"Export failed: {e}", _C["rec"], 2000)
 
         # Bindings
         lb.bind("<<ListboxSelect>>", _on_select)
@@ -6291,7 +6726,9 @@ h1{{font-size:30px}}
             )
             return
         speed = max(0.1, min(10.0, self.cfg.speed))
-        for ev in evs:
+        for i, ev in enumerate(evs):
+            if self._stop_ev.is_set():
+                break
             if self._stop_ev.is_set():
                 break
             delay = max(ev.get("d", 0), 0) / 1000.0 / speed
@@ -6417,9 +6854,6 @@ h1{{font-size:30px}}
                     _send_input(_mouse_move_rel(dx, dy))
                 _send_input(_mouse_wheel(cx, cy, ev.get("delta", 0), h=True))
             elif t == "D":
-                pass
-            elif t == "B":
-                # Branch/if-image — treat as found (continue) in fallback replay
                 pass
             elif t == "R":
                 # Bug 16: Run sub-macro event for Python fallback playback
@@ -8492,6 +8926,16 @@ h1{{font-size:30px}}
             "big_mode",
             callback=self._apply_big,
         )
+        _chk(
+            inn1,
+            "Close Minimizes to Tray",
+            "close_minimizes",
+        )
+        _chk(
+            inn1,
+            "Show Recorder Overlay",
+            "recorder_overlay",
+        )
         tk.Frame(inn1, bg=SBG, height=10).pack()
 
         inn4 = sf4.inner
@@ -8977,6 +9421,98 @@ h1{{font-size:30px}}
             w.bind("<Button-1>", lambda _: _export_macro())
         for w in (imp_f, imp_l):
             w.bind("<Button-1>", lambda _: _import_macro())
+
+        # Export as standalone .ahk button
+        ahk_btn_row = tk.Frame(inn5, bg=SBG)
+        ahk_btn_row.pack(fill="x", padx=PX, pady=(0, 6))
+        ahk_exp_f = tk.Frame(ahk_btn_row, bg=SBORD, cursor="hand2")
+        ahk_exp_f.pack(fill="x")
+        ahk_exp_l = tk.Label(
+            ahk_exp_f,
+            text="Export as .ahk (Standalone AutoHotkey Script)",
+            bg=SBORD,
+            fg=SMUTED,
+            font=("Segoe UI", 7, "bold"),
+            cursor="hand2",
+            anchor="center",
+            pady=6,
+        )
+        ahk_exp_l.pack(fill="x")
+
+        def _export_ahk_share():
+            if not self.events:
+                sstat.config(text="No events to export", fg=SREC)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=win,
+                title="Export as AutoHotkey Script",
+                defaultextension=".ahk",
+                filetypes=[("AutoHotkey Script", "*.ahk")],
+                initialfile="macro_export.ahk",
+            )
+            if not path:
+                return
+            try:
+                lines = [
+                    "#Requires AutoHotkey v2.0",
+                    "#SingleInstance Force",
+                    'SendMode "Input"',
+                    'CoordMode "Mouse", "Screen"',
+                    "",
+                    "; Generated by TinyKullan",
+                    f"; {len(self.events)} events",
+                    "",
+                    "Esc::ExitApp",
+                    "",
+                ]
+                for ev in self.events:
+                    t = ev.get("t", "")
+                    d = ev.get("d", 0)
+                    if t == "M":
+                        lines.append(f"MouseMove {ev.get('x', 0)}, {ev.get('y', 0)}, 0")
+                    elif t == "C":
+                        btn = ev.get("btn", "left")
+                        lines.append(
+                            f'MouseClick "{btn}", {ev.get("x", 0)}, {ev.get("y", 0)}, 1, 0'
+                        )
+                    elif t == "K":
+                        vk = ev.get("vk", 0)
+                        key_name = _vk_to_compact_name(vk)
+                        if key_name:
+                            up = ev.get("up", False)
+                            if up:
+                                lines.append(f"Send '{{{key_name} up}}'")
+                            else:
+                                d_ms = max(d, 50)
+                                if d_ms < 100:
+                                    lines.append(f"Send '{{{key_name}}}'")
+                                else:
+                                    lines.append(f"Send '{{{key_name} down}}'")
+                                    lines.append(f"Sleep {d_ms}")
+                                    lines.append(f"Send '{{{key_name} up}}'")
+                    elif t == "W":
+                        delta = ev.get("delta", 120)
+                        direction = "WheelUp" if delta > 0 else "WheelDown"
+                        lines.append(f"Send '{{{direction}}}'")
+                    elif t == "D":
+                        lines.append(f"Sleep {max(1, d)}")
+                    elif t == "R":
+                        name = ev.get("name", "")
+                        lines.append(f"; Run sub-macro: {name}")
+                        lines.append("; NOTE: Sub-macros require TinyKullan to resolve")
+                    if d > 0 and t not in ("K", "D"):
+                        lines.append(f"Sleep {max(1, d)}")
+                lines.append("")
+                lines.append('MsgBox "Macro finished."')
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                sstat.config(text=f"Exported to {Path(path).name}", fg=SPLAY)
+                win.after(3000, lambda: sstat.config(text="", fg=SMUTED))
+            except Exception as e:
+                sstat.config(text=f"Export failed: {e}", fg=SREC)
+
+        for w in (ahk_exp_f, ahk_exp_l):
+            w.bind("<Button-1>", lambda _: _export_ahk_share())
 
         tk.Frame(inn5, bg=SBG, height=12).pack()
 

@@ -434,8 +434,6 @@ PlayWorker() {
                     SendMouseInput(dx, dy, 0x0001)
                 }
                 SendMouseWheelInput(ev.delta, 0x0800)
-            } else if (t = "B") {
-                ; Branch/if-image — AHK cannot do image detection, skip unconditionally
             }
         }
 
