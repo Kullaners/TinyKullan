@@ -10,7 +10,6 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Kullaners/TinyKullan)
 [![License](https://img.shields.io/badge/License-GPL--3.0-green?style=for-the-badge)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/ydtJbc2u9a)
-[![Stars](https://img.shields.io/github/stars/Kullaners/TinyKullan?style=for-the-badge&color=yellow)](https://github.com/Kullaners/TinyKullan/stargazers)
 
 *Record. Replay. Share. Let it Grind while you Rest.*
 
