@@ -181,7 +181,8 @@ StartRecording() {
     Events.Push({t: "M", d: 0, x: LastX, y: LastY})
 
     ; Start the Low-Level Windows Mouse Hook (WH_MOUSE_LL = 14)
-    WindowsMouseHook := DllCall("SetWindowsHookEx", "Int", 14, "Ptr", CallbackCreate(LowLevelMouseProc, "Fast"), "Ptr", DllCall("GetModuleHandle", "Ptr", 0, "Ptr"), "UInt", 0, "Ptr")
+    Global MouseProcCallback := CallbackCreate(LowLevelMouseProc, "Fast")
+    WindowsMouseHook := DllCall("SetWindowsHookEx", "Int", 14, "Ptr", MouseProcCallback, "Ptr", DllCall("GetModuleHandle", "Ptr", 0, "Ptr"), "UInt", 0, "Ptr")
 
     if (!WindowsMouseHook) {
         MsgBox "Mouse hook failed to install. Try running as Administrator.", "TinyKullan", "Icon!"
@@ -202,6 +203,9 @@ StopRecording() {
         DllCall("UnhookWindowsHookEx", "Ptr", WindowsMouseHook)
         WindowsMouseHook := 0
     }
+    ; Free the callback to prevent memory leak across recording sessions
+    if (IsSet(MouseProcCallback))
+        CallbackFree(MouseProcCallback)
 
     SetTimer(CheckStopSignal, 0)
     StopKeyboardHook()
@@ -302,7 +306,7 @@ OnKeyPress(ih, vk, sc, extended := 0) {
     Global Recording, Events, StartTime, LastPressTimes
     if (!Recording)
         Return
-    if (vk = 0x74 || vk = 0x75 || vk = 0x77)  ; skip F5/F6/F8
+    if (vk = 0x74 || vk = 0x75 || vk = 0x76 || vk = 0x77)  ; skip F5/F6/F7/F8
         Return
 
     ; Filter OS auto-repeats: skip if same VK pressed within last 50ms
@@ -319,7 +323,7 @@ OnKeyRelease(ih, vk, sc, extended := 0) {
     Global Recording, Events, StartTime, LastPressTimes
     if (!Recording)
         Return
-    if (vk = 0x74 || vk = 0x75 || vk = 0x77)
+    if (vk = 0x74 || vk = 0x75 || vk = 0x76 || vk = 0x77)
         Return
     delay := Round(QPC() - StartTime)
     if (LastPressTimes.Has(vk))

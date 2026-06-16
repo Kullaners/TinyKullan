@@ -361,9 +361,9 @@ def _find_autohotkey():
         local_appdata = os.environ.get("LocalAppData")
         if local_appdata:
             paths = [
-                os.path.join(local_appdata, r"Programs\AutoHotkey\AutoHotkey.exe"),
-                os.path.join(local_appdata, r"Programs\AutoHotkey\v2\AutoHotkey.exe"),
                 os.path.join(local_appdata, r"Programs\AutoHotkey\v2\AutoHotkey64.exe"),
+                os.path.join(local_appdata, r"Programs\AutoHotkey\v2\AutoHotkey.exe"),
+                os.path.join(local_appdata, r"Programs\AutoHotkey\AutoHotkey.exe"),
             ]
             for p in paths:
                 if os.path.exists(p):
@@ -376,9 +376,9 @@ def _find_autohotkey():
     for base in (pf, pf86):
         if base:
             paths = [
-                os.path.join(base, r"AutoHotkey\AutoHotkey.exe"),
                 os.path.join(base, r"AutoHotkey\v2\AutoHotkey64.exe"),
                 os.path.join(base, r"AutoHotkey\v2\AutoHotkey.exe"),
+                os.path.join(base, r"AutoHotkey\AutoHotkey.exe"),
                 os.path.join(base, r"AutoHotkey\v1.1\AutoHotkey.exe"),
             ]
             for p in paths:
@@ -395,32 +395,16 @@ def _find_autohotkey():
 
 
 def _ahk_imgclick(x, y):
-    """Spawn AHK with /imgclick x y to fire a hardware left-click at (x, y).
-    This bypasses Python SendInput so Roblox accepts the click.
-    Falls back to SetCursorPos + _send_input if AHK is unavailable."""
-    import subprocess
-
+    """Fire a hardware-level left-click at (x, y) using ctypes.
+    This bypasses AHK subprocess spawning to prevent click latency and UI freeze."""
     try:
-        ahk = _find_autohotkey()
-        script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "TinyKullan.ahk"
-        )
-        if os.path.exists(script):
-            proc = subprocess.Popen(
-                [ahk, script, "/imgclick", str(int(x)), str(int(y))],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            proc.wait(timeout=2)
-            return
-    except Exception:
-        pass
-    # Fallback - use hardware-level mouse_event which Roblox accepts
-    user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.04)
-    user32.mouse_event(0x0002, 0, 0, 0, 0)  # left down
-    time.sleep(0.04)
-    user32.mouse_event(0x0004, 0, 0, 0, 0)  # left up
+        user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.005)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)  # left down
+        time.sleep(0.015)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)  # left up
+    except Exception as e:
+        _LOG.error("Direct imgclick failed: %s", e)
 
 
 # ── AHK persistent worker (module-level state) ────────────────────────────────
@@ -801,6 +785,28 @@ def _abs(x, y):
     return int(round((x - sx) * 65535.0 / max(sw - 1, 1))), int(
         round((y - sy) * 65535.0 / max(sh - 1, 1))
     )
+
+
+def _smooth_move_to(tx, ty, duration=0.12):
+    """Smoothly move the mouse from its current location to (tx, ty) over duration seconds."""
+    try:
+        pt = POINT()
+        user32.GetCursorPos(_ct.byref(pt))
+        sx, sy = pt.x, pt.y
+        dx, dy = tx - sx, ty - sy
+        if dx == 0 and dy == 0:
+            return
+        step_delay = 0.008
+        steps = max(1, int(duration / step_delay))
+        for s in range(1, steps + 1):
+            t = s / steps
+            t_smooth = t * t * (3 - 2 * t)
+            nx = int(sx + dx * t_smooth)
+            ny = int(sy + dy * t_smooth)
+            user32.SetCursorPos(nx, ny)
+            time.sleep(step_delay)
+    except Exception as e:
+        user32.SetCursorPos(int(tx), int(ty))
 
 
 def _mouse_move(x, y):
@@ -1349,19 +1355,24 @@ def _ms():
     return int(time.perf_counter() * 1000)
 
 
-def _grab_screen(mss_instance=None):
-    """M-2 fix: accepts optional persistent mss instance for reuse. Falls back to ImageGrab."""
+def _grab_screen(mss_instance=None, monitor_idx=0):
+    """M-2 fix: accepts optional persistent mss instance for reuse. Falls back to ImageGrab.
+    monitor_idx=0 grabs the full virtual desktop; 1+ grabs a specific physical monitor."""
     try:
         if mss_instance is not None:
-            monitor = mss_instance.monitors[0]
+            monitors = mss_instance.monitors
+            _idx = max(0, monitor_idx) if monitor_idx < len(monitors) else 0
+            monitor = monitors[_idx]
             img = mss_instance.grab(monitor)
-            return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
+            return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX"), monitor
         with _mss.mss() as sct:
-            monitor = sct.monitors[0]
+            monitors = sct.monitors
+            _idx = max(0, monitor_idx) if monitor_idx < len(monitors) else 0
+            monitor = monitors[_idx]
             img = sct.grab(monitor)
-            return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
+            return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX"), monitor
     except Exception:
-        return ImageGrab.grab()
+        return ImageGrab.grab(), {"left": 0, "top": 0}
 
 
 def _valid_ev(ev):
@@ -1450,6 +1461,20 @@ class Config:
         self.big_mode: bool = False
         self.close_minimizes: bool = True
         self.recorder_overlay: bool = True
+        self.last_update_sha: str = ""
+        # Feature: Pixel Color Triggers
+        self.pixel_triggers: list = []
+        # Feature: OCR Text Triggers
+        self.ocr_triggers: list = []
+        # Feature: Multi-Monitor Awareness
+        self.image_det_monitor: int = 0
+        # Feature: Macro Playlists
+        self.playlist_files: list = []
+        self.playlist_mode: str = "sequential"
+        self.playlist_gap_ms: int = 500
+        # Feature: Milestone Alerts
+        self.milestone_thresholds: list = [100, 500, 1000, 5000]
+        self.milestone_last_notified: int = 0
 
     @property
     def DEFAULTS(self):
@@ -1516,6 +1541,15 @@ class Config:
             "big_mode": False,
             "close_minimizes": True,
             "recorder_overlay": True,
+            "last_update_sha": "",
+            "pixel_triggers": "[]",
+            "ocr_triggers": "[]",
+            "image_det_monitor": 0,
+            "playlist_files": "[]",
+            "playlist_mode": "sequential",
+            "playlist_gap_ms": 500,
+            "milestone_thresholds": "[100, 500, 1000, 5000]",
+            "milestone_last_notified": 0,
         }
 
     def load(self):
@@ -1608,6 +1642,36 @@ class Config:
         self.big_mode = b("UI", "BigMode", False)
         self.close_minimizes = b("UI", "CloseMinimizes", True)
         self.recorder_overlay = b("UI", "RecorderOverlay", True)
+        self.last_update_sha = g("Updater", "LastSHA", fallback="")
+        try:
+            self.pixel_triggers = json.loads(g("PixelTriggers", "Triggers", fallback="[]"))
+        except Exception:
+            self.pixel_triggers = []
+        try:
+            self.ocr_triggers = json.loads(g("OCRTriggers", "Triggers", fallback="[]"))
+        except Exception:
+            self.ocr_triggers = []
+        try:
+            self.image_det_monitor = int(g("ImageDetection", "MonitorIndex", fallback="0"))
+        except ValueError:
+            pass
+        try:
+            self.playlist_files = json.loads(g("Playlist", "Files", fallback="[]"))
+        except Exception:
+            self.playlist_files = []
+        self.playlist_mode = g("Playlist", "Mode", fallback="sequential")
+        try:
+            self.playlist_gap_ms = int(g("Playlist", "GapMs", fallback="500"))
+        except ValueError:
+            pass
+        try:
+            self.milestone_thresholds = json.loads(g("Milestones", "Thresholds", fallback="[100, 500, 1000, 5000]"))
+        except Exception:
+            self.milestone_thresholds = [100, 500, 1000, 5000]
+        try:
+            self.milestone_last_notified = int(g("Milestones", "LastNotified", fallback="0"))
+        except ValueError:
+            pass
         try:
             self.stats_total_minutes = float(g("Stats", "TotalMinutes", fallback="0"))
         except ValueError:
@@ -1727,6 +1791,7 @@ class Config:
         cfg["ImageDetection"] = {
             "Enabled": "1" if self.img_det_enabled else "0",
             "WhileRecording": "1" if self.img_detect_while_recording else "0",
+            "MonitorIndex": str(self.image_det_monitor),
         }
         cfg["Roblox"] = {
             "Enabled": "1" if self.roblox_enabled else "0",
@@ -1751,6 +1816,20 @@ class Config:
             "CustomTitle": self.stats_custom_title,
         }
         cfg["Theme"] = dict(self.theme)
+        cfg["Updater"] = {
+            "LastSHA": self.last_update_sha,
+        }
+        cfg["PixelTriggers"] = {"Triggers": json.dumps(self.pixel_triggers or [])}
+        cfg["OCRTriggers"] = {"Triggers": json.dumps(self.ocr_triggers or [])}
+        cfg["Playlist"] = {
+            "Files": json.dumps(self.playlist_files or []),
+            "Mode": self.playlist_mode,
+            "GapMs": str(self.playlist_gap_ms),
+        }
+        cfg["Milestones"] = {
+            "Thresholds": json.dumps(self.milestone_thresholds or [100, 500, 1000, 5000]),
+            "LastNotified": str(self.milestone_last_notified),
+        }
         with open(INI_PATH, "w", encoding="utf-8") as f:
             cfg.write(f)
 
@@ -4384,7 +4463,9 @@ class App:
 
     def _toggle_pause(self):
         if self._ahk_proc is not None:
-            self.set_status("Pause not supported in AHK mode", _C["rec"], 1500)
+            # AHK playback can't truly pause mid-stream, so stop instead
+            self._stop_playback()
+            self.set_status("Stopped (cannot pause AHK)", _C["rec"], 2000)
             return
         self._pause_playback = not self._pause_playback
         label = "Resume" if self._pause_playback else "Pause"
@@ -4497,6 +4578,9 @@ class App:
         def _on_ahk_done():
             self._ahk_proc = None
             iteration[0] += 1
+            # Reset per-iteration image dedup so looped runs re-detect images
+            with self._click_lock:
+                self._clicked_this_run = set()
             if self._stop_ev.is_set() or not loop:
                 _finish()
                 return
@@ -6749,6 +6833,10 @@ h1{{font-size:30px}}
 
     def _replay(self, ev, depth=0, speed=1.0):
         t = ev.get("t", "")
+        # Handle IF/ELSE branch event (Python-only feature)
+        if t == "IF":
+            self._replay_if_event(ev, depth, speed)
+            return
         try:
             if t == "M":
                 cx, cy = int(ev["x"]), int(ev["y"])
@@ -6883,7 +6971,7 @@ h1{{font-size:30px}}
                     template = cv2.imread(img_path, cv2.IMREAD_COLOR)
                     if template is not None:
                         try:
-                            screen = _grab_screen()
+                            screen, _mon = _grab_screen()
                             screen_np = np.array(screen)
                             screen_bgr = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
                             max_val, match_pt = self._find_best_match(
@@ -6934,6 +7022,55 @@ h1{{font-size:30px}}
                             )
         except Exception as e:
             _LOG.debug("Replay: %s – %r", e, ev)
+
+    def _replay_if_event(self, ev, depth, speed):
+        """Execute IF/ELSE branch macro logic. Captures screen, checks for image,
+        then runs then_evs or else_evs accordingly."""
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            _LOG.warning("IF event: cv2/numpy not available — skipping")
+            return
+        name = ev.get("name", "")
+        img_path = ""
+        if name:
+            rp = self._resolve_run_path(name)
+            if rp and os.path.exists(rp):
+                img_path = rp
+            elif os.path.exists(name):
+                img_path = name
+        if not img_path:
+            # Image not resolvable → run else branch
+            else_evs = ev.get("else_evs", [])
+            if else_evs:
+                self._replay_inline_events(else_evs, depth + 1)
+            return
+        template = get_cached_template(img_path)
+        if template is None:
+            else_evs = ev.get("else_evs", [])
+            if else_evs:
+                self._replay_inline_events(else_evs, depth + 1)
+            return
+        try:
+            screen, _mon = _grab_screen(getattr(self, "_persistent_mss", None))
+            screen_np = np.array(screen)
+            screen_bgr = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
+            del screen, screen_np
+        except Exception as e:
+            _LOG.warning("IF event: screenshot failed: %s", e)
+            else_evs = ev.get("else_evs", [])
+            if else_evs:
+                self._replay_inline_events(else_evs, depth + 1)
+            return
+        threshold = float(ev.get("threshold", 0.75))
+        max_val, _ = self._find_best_match(screen_bgr, template)
+        if max_val >= threshold:
+            branch = ev.get("then_evs", [])
+        else:
+            branch = ev.get("else_evs", [])
+        if branch:
+            self._replay_inline_events(branch, depth + 1)
 
     def _release_held(self):
         with self._held_lock:
@@ -7658,6 +7795,7 @@ h1{{font-size:30px}}
         self._roi_cache = {}
         last_check = 0.0
         last_disc_check = 0.0
+        last_pixel_check = 0.0
         while True:
             try:
                 now = time.time()
@@ -7673,7 +7811,7 @@ h1{{font-size:30px}}
                     if now - last_disc_check >= disc_interval:
                         last_disc_check = now
                         try:
-                            screen = _grab_screen(self._persistent_mss)
+                            screen, _mon = _grab_screen(self._persistent_mss)
                             import cv2
                             import numpy as np
 
@@ -8021,15 +8159,24 @@ h1{{font-size:30px}}
                 self.root.after(0, self._reset_ui)
                 return
 
-            # Optional recovery macro
+            # Optional recovery macro — detects compact vs JSON format
             rec_run_path = getattr(self.cfg, "roblox_recovery_run", "")
             if rec_run_path and os.path.exists(rec_run_path):
                 _LOG.info("Running recovery macro: %s", rec_run_path)
                 try:
                     with open(rec_run_path, encoding="utf-8") as rf:
-                        rec_data = json.load(rf)
-                    if isinstance(rec_data, list):
-                        rec_evs = [ev for ev in rec_data if _valid_ev(ev)]
+                        first_char = rf.read(1)
+                        rf.seek(0)
+                        if first_char == "#":
+                            rec_evs = _read_compact_run(rec_run_path)
+                        else:
+                            rec_data = json.load(rf)
+                            rec_evs = (
+                                [ev for ev in rec_data if _valid_ev(ev)]
+                                if isinstance(rec_data, list)
+                                else []
+                            )
+                    if rec_evs:
                         speed = max(0.1, min(10.0, self.cfg.speed))
                         rec_delays = [
                             max(ev.get("d", 0), 0) / 1000.0 / speed for ev in rec_evs
@@ -8098,7 +8245,10 @@ h1{{font-size:30px}}
             return
 
         try:
-            screen = _grab_screen(getattr(self, "_persistent_mss", None))
+            mon_idx = getattr(self.cfg, "image_det_monitor", 0)
+            screen, _mon_info = _grab_screen(getattr(self, "_persistent_mss", None), monitor_idx=mon_idx)
+            _mon_offset_x = _mon_info.get("left", 0) if isinstance(_mon_info, dict) else 0
+            _mon_offset_y = _mon_info.get("top", 0) if isinstance(_mon_info, dict) else 0
             screen_np = np.array(screen)
             del screen
             screen_bgr = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
@@ -8131,9 +8281,53 @@ h1{{font-size:30px}}
             )
             # S-4 fix: use per-image threshold if configured, else 0.90
             threshold = float(tgt.get("threshold", 0.90))
+            found = max_val >= threshold
+            if not found:
+                fallback_txt = tgt.get("ocr_fallback_text", "").strip()
+                if fallback_txt:
+                    try:
+                        import pytesseract as _pt
+                        common_paths = [
+                            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Tesseract-OCR\tesseract.exe"),
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)), r"Tesseract-OCR\tesseract.exe"),
+                            r"C:\TinyKullan\Tesseract-OCR\tesseract.exe",
+                        ]
+                        for path in common_paths:
+                            if os.path.exists(path):
+                                _pt.pytesseract.tesseract_cmd = path
+                                break
+                        pil_img = Image.fromarray(cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2RGB))
+                        data = _pt.image_to_data(pil_img, output_type=_pt.Output.DICT)
+                        words = fallback_txt.lower().split()
+                        n = len(data["text"])
+                        for i in range(n):
+                            match = True
+                            for j, word in enumerate(words):
+                                if i + j >= n:
+                                    match = False
+                                    break
+                                if data["text"][i + j].strip().lower() != word:
+                                    match = False
+                                    break
+                            if match:
+                                lefts = [data["left"][i + k] for k in range(len(words))]
+                                tops = [data["top"][i + k] for k in range(len(words))]
+                                rights = [data["left"][i + k] + data["width"][i + k] for k in range(len(words))]
+                                bottoms = [data["top"][i + k] + data["height"][i + k] for k in range(len(words))]
+                                match_pt = ((min(lefts) + max(rights)) // 2, (min(tops) + max(bottoms)) // 2)
+                                max_val = 1.0
+                                found = True
+                                break
+                    except Exception as ocre:
+                        _LOG.error("OCR fallback failed: %s", ocre)
             # S-6 fix: only unpack coordinates AFTER threshold check passes
-            if max_val >= threshold:
+            if found:
                 match_x, match_y = match_pt
+                # Offset coordinates if targeting a specific monitor
+                match_x += _mon_offset_x
+                match_y += _mon_offset_y
                 name = tgt.get("name", "Image")
 
                 _LOG.info(
@@ -8164,19 +8358,11 @@ h1{{font-size:30px}}
                     user32.GetCursorPos(_ct.byref(pt))
                     orig_x, orig_y = pt.x, pt.y
 
-                    # Teleport slower — break move into steps
-                    dx = int(match_x) - pt.x
-                    dy = int(match_y) - pt.y
-                    steps = 4
-                    for s in range(1, steps + 1):
-                        user32.SetCursorPos(
-                            pt.x + dx * s // steps, pt.y + dy * s // steps
-                        )
-                        time.sleep(0.015)
+                    # Smooth move to target
+                    _smooth_move_to(int(match_x), int(match_y), duration=0.12)
+                    time.sleep(0.02)  # settle delay
 
-                    time.sleep(0.150)  # settle delay
-
-                    # Three clicks spread around the image — AHK for Roblox compat
+                    # Three clicks spread around the image - direct fast hardware click
                     offsets = [(0, 0), (-4, -4), (4, -3)]
                     self.root.after(
                         0,
@@ -8186,10 +8372,10 @@ h1{{font-size:30px}}
                     )
                     for ox, oy in offsets:
                         _ahk_imgclick(int(match_x) + ox, int(match_y) + oy)
-                        time.sleep(0.080)
+                        time.sleep(0.015)
 
-                    # Restore cursor
-                    user32.SetCursorPos(orig_x, orig_y)
+                    # Restore cursor smoothly
+                    _smooth_move_to(orig_x, orig_y, duration=0.12)
 
                     break  # screen changed; re-capture next cycle
                 else:
@@ -8261,7 +8447,7 @@ h1{{font-size:30px}}
 
                 # Take fresh screenshot
                 try:
-                    screen = _grab_screen()
+                    screen, _mon = _grab_screen()
                     screen_np = np.array(screen)
                     del screen
                     screen_bgr = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
@@ -8353,7 +8539,7 @@ h1{{font-size:30px}}
             f = Path(self.cfg.shot_folder)
             f.mkdir(parents=True, exist_ok=True)
             name = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + (suffix or "") + ".png"
-            _grab_screen().save(f / name)
+            _grab_screen()[0].save(f / name)
             self.root.after(0, lambda: self.set_status("", _C["acc"], 1500))
             return str(f / name)
         except Exception as e:
@@ -8417,10 +8603,13 @@ h1{{font-size:30px}}
             with self._stats_lock:
                 self.cfg.stats_run_count += 1
                 self.cfg.stats_total_minutes += play_ms / 60000.0
+                _new_count = self.cfg.stats_run_count
             try:
                 self.cfg.save()
             except Exception:
                 pass
+            # Check milestone alerts in background thread
+            threading.Thread(target=self._check_milestones, args=(_new_count,), daemon=True).start()
         url = self.cfg.webhook_url.strip()
         if not url or not (
             (was_loop and self.cfg.wh_loop) or (not was_loop and self.cfg.wh_play)
@@ -8615,9 +8804,9 @@ h1{{font-size:30px}}
             self._cached_rects = None
 
         ob = tk.Frame(win, bg=SBORD)
-        ob.place(x=0, y=0, width=SW, height=SH)
+        ob.place(x=0, y=0, relwidth=1.0, relheight=1.0)
         wp = tk.Frame(ob, bg=SBG)
-        wp.place(x=1, y=1, width=SW - 2, height=SH - 2)
+        wp.place(x=1, y=1, relwidth=1.0, relheight=1.0, width=-2, height=-2)
 
         stb = tk.Frame(wp, bg=SSURF, height=26)
         stb.pack(fill="x")
@@ -8680,6 +8869,25 @@ h1{{font-size:30px}}
         )
         sbl.pack(padx=1, pady=1)
 
+        # Drag resize logic
+        def start_resize(event):
+            win._start_w = win.winfo_width()
+            win._start_h = win.winfo_height()
+            win._start_x = event.x_root
+            win._start_y = event.y_root
+
+        def perform_resize(event):
+            dx = event.x_root - win._start_x
+            dy = event.y_root - win._start_y
+            new_w = max(420, win._start_w + dx)
+            new_h = max(300, win._start_h + dy)
+            win.geometry(f"{new_w}x{new_h}")
+
+        grip = tk.Label(wp, text="◢", bg=SSURF, fg=SMUTED, cursor="size_nw_se", font=("Segoe UI", 8))
+        grip.place(relx=1.0, rely=1.0, anchor="se", x=0, y=0)
+        grip.bind("<ButtonPress-1>", start_resize)
+        grip.bind("<B1-Motion>", perform_resize)
+
         body = tk.Frame(wp, bg=SBG)
         body.pack(fill="both", expand=True)
         BH2 = SH - 26 - 1 - 24 - 1 - 29
@@ -8688,10 +8896,8 @@ h1{{font-size:30px}}
         sf3 = ScrollFrame(body, SBG, SW - 2, BH2)
         sf4 = ScrollFrame(body, SBG, SW - 2, BH2)
         sf5 = ScrollFrame(body, SBG, SW - 2, BH2)
-        sf6 = ScrollFrame(body, SBG, SW - 2, BH2)
-        sf7 = ScrollFrame(body, SBG, SW - 2, BH2)
-        self._scroll_frames = [sf1, sf2, sf3, sf4, sf5, sf6, sf7]
-        for sf in (sf1, sf2, sf3, sf4, sf5, sf6, sf7):
+        self._scroll_frames = [sf1, sf2, sf3, sf4, sf5]
+        for sf in (sf1, sf2, sf3, sf4, sf5):
             sf.outer.place(x=0, y=0, relwidth=1, relheight=1)
 
         cur, tbtns = [0], []
@@ -8701,20 +8907,18 @@ h1{{font-size:30px}}
                 return
             cur[0] = n
             for i, (b, sf) in enumerate(
-                zip(tbtns, (sf1, sf4, sf2, sf3, sf5, sf6, sf7))
+                zip(tbtns, (sf1, sf2, sf3, sf4, sf5))
             ):
                 b.config(bg=SBG if i == n else SSURF, fg=STEXT if i == n else SMUTED)
-            (sf1, sf4, sf2, sf3, sf5, sf6, sf7)[n].outer.lift()
+            (sf1, sf2, sf3, sf4, sf5)[n].outer.lift()
 
         for i, lbl in enumerate(
             [
                 "  Main  ",
-                "  Clicker  ",
-                "  Webhook  ",
-                "  Theme  ",
-                "  Share  ",
                 "  Detection  ",
-                "  Roblox  ",
+                "  Tools  ",
+                "  Theme & Share  ",
+                "  Playlist  ",
             ]
         ):
             b = tk.Label(
@@ -8936,9 +9140,58 @@ h1{{font-size:30px}}
             "Show Recorder Overlay",
             "recorder_overlay",
         )
+
+        _sec(inn1, "KULLAN UPDATER")
+        _sha = self.cfg.last_update_sha
+        _sha_display = (_sha[:10] + "...") if len(_sha) > 10 else (_sha or "Not tracked")
+        _upd_status_lbl = tk.Label(
+            inn1,
+            text=f"Local version: {_sha_display}",
+            bg=SBG,
+            fg=SMUTED,
+            font=("Segoe UI", 7),
+            anchor="w",
+        )
+        _upd_status_lbl.pack(fill="x", padx=PX, pady=(2, 4))
+
+        _upd_result_lbl = tk.Label(
+            inn1,
+            text="",
+            bg=SBG,
+            fg=SMUTED,
+            font=("Segoe UI", 7, "italic"),
+            anchor="w",
+            wraplength=200,
+            justify="left",
+        )
+        _upd_result_lbl.pack(fill="x", padx=PX, pady=(0, 4))
+
+        _upd_btn = tk.Label(
+            inn1,
+            text="  ⬆ Check for Updates  ",
+            bg=SACC_D,
+            fg=STEXT,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+            padx=8,
+            pady=4,
+        )
+        _upd_btn.pack(padx=PX, pady=(2, 6))
+
+        def _do_check_update(e=None):
+            _upd_btn.config(text="  Checking...  ", fg=SMUTED)
+            _upd_result_lbl.config(text="", fg=SMUTED)
+            self.check_for_updates(
+                status_label=_upd_result_lbl,
+                btn_label=_upd_btn,
+                sha_label=_upd_status_lbl,
+            )
+
+        _upd_btn.bind("<Button-1>", _do_check_update)
+
         tk.Frame(inn1, bg=SBG, height=10).pack()
 
-        inn4 = sf4.inner
+        inn4 = sf3.inner
         _sec(inn4, "AUTO CLICKER SETTINGS")
         _lbl(inn4, "Hotkey (to start/stop)")
         HotkeyEntry(
@@ -8996,7 +9249,7 @@ h1{{font-size:30px}}
             ).pack(side="left", padx=(0, 10))
         tk.Frame(inn4, bg=SBG, height=12).pack()
 
-        inn2 = sf2.inner
+        inn2 = sf3.inner
         _sec(inn2, "DISCORD WEBHOOK")
         _lbl(inn2, "URL")
         ue_f = tk.Frame(inn2, bg=SED, highlightbackground=SEDB, highlightthickness=1)
@@ -9052,9 +9305,49 @@ h1{{font-size:30px}}
         _chk(inn2, "Loop complete", "wh_loop")
         _sec(inn2, "CAPTURE")
         _chk(inn2, "Auto-screenshot after playback", "wh_screenshot")
+        
+        _sec(inn2, "MILESTONE ALERTS")
+        _lbl(inn2, "Run Milestones (comma-separated, e.g. 100, 500, 1000)")
+        miles_entry_f = tk.Frame(inn2, bg=SED, highlightbackground=SEDB, highlightthickness=1)
+        miles_entry_f.pack(fill="x", padx=PX, pady=3)
+        miles_entry = tk.Entry(
+            miles_entry_f,
+            bg=SED,
+            fg=STEXT,
+            font=("Segoe UI", 7),
+            bd=0,
+            insertbackground=STEXT,
+        )
+        miles_entry.pack(fill="x", padx=4, pady=3)
+        miles_entry.insert(0, ", ".join(str(t) for t in self.cfg.milestone_thresholds))
+        
+        tst_btn_f = tk.Frame(inn2, bg=SSURF, highlightbackground=SEDB, highlightthickness=1)
+        tst_btn_f.pack(padx=PX, pady=5, anchor="w")
+        tst_btn = tk.Label(
+            tst_btn_f,
+            text="  Test Milestone Alert  ",
+            bg=SSURF,
+            fg=STEXT,
+            font=("Segoe UI", 7, "bold"),
+            cursor="hand2",
+        )
+        tst_btn.pack(padx=6, pady=3)
+        
+        def _test_milestone_alert():
+            try:
+                thresholds = [int(x.strip()) for x in miles_entry.get().split(",") if x.strip().isdigit()]
+                self.cfg.milestone_thresholds = thresholds
+                self.cfg.save()
+            except Exception:
+                pass
+            val = self.cfg.stats_run_count
+            threading.Thread(target=self._check_milestones, args=(val or 100,), daemon=True).start()
+            
+        tst_btn.bind("<Button-1>", lambda _: _test_milestone_alert())
+        
         tk.Frame(inn2, bg=SBG, height=12).pack()
 
-        inn3 = sf3.inner
+        inn3 = sf4.inner
         _sec(inn3, "BUTTON ICONS")
         ico_entries = {}
         for ico_label, ico_attr in [
@@ -9229,7 +9522,7 @@ h1{{font-size:30px}}
 
         tk.Frame(inn3, bg=SBG, height=12).pack()
 
-        inn5 = sf5.inner
+        inn5 = sf4.inner
         _sec(inn5, "SHARE MACRO")
 
         macro_info_lbl = tk.Label(
@@ -9517,7 +9810,7 @@ h1{{font-size:30px}}
         tk.Frame(inn5, bg=SBG, height=12).pack()
 
         # TAB 6: DETECTION
-        inn6 = sf6.inner
+        inn6 = sf2.inner
         _sec(inn6, "IMAGE DETECTION")
 
         _chk(inn6, "Enable image check during playback", "img_det_enabled")
@@ -9661,6 +9954,32 @@ h1{{font-size:30px}}
                 )
                 pri_lbl.pack(side="right", padx=(4, 2))
 
+                # OCR Fallback Text Input
+                fb_var = tk.StringVar(value=tgt.get("ocr_fallback_text", ""))
+                fb_ent = tk.Entry(
+                    row,
+                    textvariable=fb_var,
+                    bg=SED,
+                    fg=STEXT,
+                    font=("Segoe UI", 7),
+                    insertbackground=STEXT,
+                    width=10,
+                    bd=0,
+                    highlightthickness=0,
+                )
+                fb_ent.pack(side="right", padx=(2, 6))
+                
+                def make_fb_updater(t=tgt, var=fb_var):
+                    def _update(*_):
+                        t["ocr_fallback_text"] = var.get()
+                    var.trace_add("write", _update)
+                make_fb_updater()
+                
+                fb_lbl = tk.Label(
+                    row, text="OCR Fallback:", bg=SSURF, fg=SMUTED, font=("Segoe UI", 7)
+                )
+                fb_lbl.pack(side="right", padx=(4, 2))
+
                 name_lbl.pack(side="left", fill="x", expand=True)
 
                 def make_viewer(t=tgt):
@@ -9712,7 +10031,7 @@ h1{{font-size:30px}}
 
                             while time.perf_counter() - start_time < search_duration:
                                 try:
-                                    screen = _grab_screen()
+                                    screen, _mon = _grab_screen()
                                     screen_np = np.array(screen)
                                     screen_bgr = cv2.cvtColor(
                                         screen_np, cv2.COLOR_RGB2BGR
@@ -9987,9 +10306,37 @@ h1{{font-size:30px}}
 
         _render_image_list()
 
+        # Monitor index selector
+        mon_row = tk.Frame(inn6, bg=SBG)
+        mon_row.pack(fill="x", padx=PX, pady=4)
+        tk.Label(
+            mon_row,
+            text="Capture Monitor:",
+            bg=SBG,
+            fg=STEXT,
+            font=("Segoe UI", 8),
+            anchor="w",
+        ).pack(side="left")
+        
+        # Get count of monitors
+        import mss as _mss_module
+        try:
+            with _mss_module.mss() as sct:
+                mon_count = len(sct.monitors)
+        except Exception:
+            mon_count = 2 # fallback
+            
+        mon_options = ["All (virtual screen)"] + [f"Monitor {i}" for i in range(1, mon_count)]
+        mon_var = tk.StringVar(value=mon_options[min(max(0, self.cfg.image_det_monitor), len(mon_options)-1)])
+        
+        mon_menu = tk.OptionMenu(mon_row, mon_var, *mon_options)
+        mon_menu.config(bg=SSURF, fg=STEXT, font=("Segoe UI", 7), bd=1, highlightthickness=0)
+        mon_menu["menu"].config(bg=SSURF, fg=STEXT, font=("Segoe UI", 7))
+        mon_menu.pack(side="left", padx=10)
+
         tk.Frame(inn6, bg=SBG, height=12).pack()
 
-        inn7 = sf7.inner
+        inn7 = sf3.inner
         _sec(inn7, "ROBLOX AUTO RECOVERY")
         _chk(inn7, "Enable Auto Recovery", "roblox_enabled")
 
@@ -10251,10 +10598,145 @@ h1{{font-size:30px}}
 
         tk.Frame(inn7, bg=SBG, height=12).pack()
 
+        # TAB 8: PLAYLIST
+        inn8 = sf5.inner
+        _sec(inn8, "MACRO PLAYLIST")
+        
+        self.temp_playlist_files = list(self.cfg.playlist_files)
+        
+        playlist_list_frame = tk.Frame(inn8, bg=SBG)
+        playlist_list_frame.pack(fill="x", padx=PX, pady=4)
+        
+        def _render_playlist():
+            for child in playlist_list_frame.winfo_children():
+                child.destroy()
+            if not self.temp_playlist_files:
+                tk.Label(playlist_list_frame, text="No macros in playlist.", bg=SBG, fg=SMUTED, font=("Segoe UI", 7)).pack(pady=10)
+                return
+            for idx, fpath in enumerate(self.temp_playlist_files):
+                row = tk.Frame(playlist_list_frame, bg=SSURF, padx=6, pady=4)
+                row.pack(fill="x", pady=2)
+                
+                name = os.path.basename(fpath)
+                tk.Label(row, text=name, bg=SSURF, fg=STEXT, font=("Segoe UI", 7, "bold"), anchor="w").pack(side="left", fill="x", expand=True)
+                
+                def _move_up(i=idx):
+                    if i > 0:
+                        self.temp_playlist_files[i], self.temp_playlist_files[i-1] = self.temp_playlist_files[i-1], self.temp_playlist_files[i]
+                        _render_playlist()
+                def _move_down(i=idx):
+                    if i < len(self.temp_playlist_files) - 1:
+                        self.temp_playlist_files[i], self.temp_playlist_files[i+1] = self.temp_playlist_files[i+1], self.temp_playlist_files[i]
+                        _render_playlist()
+                def _remove_play(i=idx):
+                    self.temp_playlist_files.pop(i)
+                    _render_playlist()
+                    
+                up = tk.Label(row, text=" ▲ ", bg=SSURF, fg=SACC, font=("Segoe UI", 7), cursor="hand2")
+                up.pack(side="left", padx=2)
+                up.bind("<Button-1>", lambda _, i=idx: _move_up(i))
+                
+                dn = tk.Label(row, text=" ▼ ", bg=SSURF, fg=SACC, font=("Segoe UI", 7), cursor="hand2")
+                dn.pack(side="left", padx=2)
+                dn.bind("<Button-1>", lambda _, i=idx: _move_down(i))
+                
+                rm = tk.Label(row, text=" ✗ ", bg=SSURF, fg=SREC, font=("Segoe UI", 7, "bold"), cursor="hand2")
+                rm.pack(side="left", padx=2)
+                rm.bind("<Button-1>", lambda _, i=idx: _remove_play(i))
+                
+        def _add_playlist_file():
+            from tkinter import filedialog
+            files = filedialog.askopenfilenames(
+                title="Select Macros to Add",
+                filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
+            )
+            if files:
+                for f in files:
+                    self.temp_playlist_files.append(os.path.abspath(f))
+                _render_playlist()
+                
+        add_play_btn_f = tk.Frame(inn8, bg=SACC, cursor="hand2")
+        add_play_btn_f.pack(padx=PX, pady=5, anchor="w")
+        add_play_btn_lbl = tk.Label(
+            add_play_btn_f,
+            text="  + Add Macro to Playlist  ",
+            bg=SACC,
+            fg=STEXT,
+            font=("Segoe UI", 7, "bold"),
+            cursor="hand2",
+        )
+        add_play_btn_lbl.pack(padx=6, pady=3)
+        add_play_btn_lbl.bind("<Button-1>", lambda _: _add_playlist_file())
+        
+        _sec(inn8, "PLAYLIST SETTINGS")
+        
+        mode_row = tk.Frame(inn8, bg=SBG)
+        mode_row.pack(fill="x", padx=PX, pady=4)
+        tk.Label(mode_row, text="Playback Mode:", bg=SBG, fg=STEXT, font=("Segoe UI", 8), anchor="w").pack(side="left")
+        
+        play_mode_var = tk.StringVar(value=self.cfg.playlist_mode)
+        play_mode_menu = tk.OptionMenu(mode_row, play_mode_var, "sequential", "random")
+        play_mode_menu.config(bg=SSURF, fg=STEXT, font=("Segoe UI", 7), bd=1, highlightthickness=0)
+        play_mode_menu.pack(side="left", padx=10)
+        
+        gap_row = tk.Frame(inn8, bg=SBG)
+        gap_row.pack(fill="x", padx=PX, pady=4)
+        tk.Label(gap_row, text="Gap between macros (ms):", bg=SBG, fg=STEXT, font=("Segoe UI", 8), anchor="w").pack(side="left")
+        
+        gap_var = tk.IntVar(value=self.cfg.playlist_gap_ms)
+        gap_spin = tk.Spinbox(gap_row, from_=0, to=10000, increment=100, textvariable=gap_var, bg=SED, fg=STEXT, font=("Segoe UI", 7), width=6, bd=0)
+        gap_spin.pack(side="left", padx=10)
+        
+        start_play_btn_f = tk.Frame(inn8, bg=SPLAY, cursor="hand2")
+        start_play_btn_f.pack(fill="x", padx=PX, pady=15)
+        start_play_btn_lbl = tk.Label(
+            start_play_btn_f,
+            text="  ▶ Start Playlist  ",
+            bg=SPLAY,
+            fg=STEXT,
+            font=("Segoe UI", 8, "bold"),
+            cursor="hand2",
+            anchor="center",
+            pady=6
+        )
+        start_play_btn_lbl.pack(fill="x", padx=2, pady=2)
+        start_play_btn_lbl.bind("<Button-1>", lambda _: self.start_playlist())
+        
+        _render_playlist()
+
+        tk.Frame(inn8, bg=SBG, height=12).pack()
+
         def _save_all():
             setattr(self.cfg, "roblox_disconnect_img", roblox_img_en.get())
             setattr(self.cfg, "roblox_server_link", roblox_link_en.get())
             setattr(self.cfg, "roblox_recovery_run", roblox_run_en.get())
+            
+            # Save new features
+            self.cfg.pixel_triggers = list(self.temp_pixel_triggers)
+            self.cfg.ocr_triggers = list(self.temp_ocr_triggers)
+            
+            # Parse monitor
+            try:
+                mon_sel = mon_var.get()
+                if "Monitor" in mon_sel:
+                    self.cfg.image_det_monitor = int(mon_sel.split()[-1])
+                else:
+                    self.cfg.image_det_monitor = 0
+            except Exception:
+                self.cfg.image_det_monitor = 0
+                
+            # Parse milestone thresholds
+            try:
+                self.cfg.milestone_thresholds = [int(x.strip()) for x in miles_entry.get().split(",") if x.strip().isdigit()]
+            except Exception:
+                pass
+                
+            self.cfg.playlist_files = list(self.temp_playlist_files)
+            self.cfg.playlist_mode = play_mode_var.get()
+            try:
+                self.cfg.playlist_gap_ms = int(gap_var.get())
+            except Exception:
+                pass
             for a, e in path_entries.items():
                 setattr(self.cfg, a, e.get())
             for a, e in ico_entries.items():
@@ -10282,6 +10764,299 @@ h1{{font-size:30px}}
         win.update_idletasks()
         if win.winfo_id():
             _round_hwnd(_get_hwnd(win.winfo_id()))
+
+    def check_for_updates(self, status_label=None, btn_label=None, sha_label=None):
+        """Check GitHub for a newer commit. If found, prompt and run the updater."""
+        REPO = "Kullaners/TinyKullan"
+        BRANCH = "main"
+        API_URL = f"https://api.github.com/repos/{REPO}/commits/{BRANCH}"
+        ZIP_URL = f"https://github.com/{REPO}/archive/refs/heads/{BRANCH}.zip"
+
+        def _reset_btn(text="  ⬆ Check for Updates  "):
+            if btn_label:
+                try:
+                    btn_label.config(text=text, fg=STEXT)
+                except Exception:
+                    pass
+
+        def _set_result(text, color=None):
+            if status_label:
+                try:
+                    status_label.config(text=text, fg=color or SMUTED)
+                except Exception:
+                    pass
+
+        def _set_sha_display(sha):
+            if sha_label:
+                try:
+                    display = (sha[:10] + "...") if len(sha) > 10 else (sha or "Not tracked")
+                    sha_label.config(text=f"Local version: {display}")
+                except Exception:
+                    pass
+
+        def _worker():
+            try:
+                resp = requests.get(
+                    API_URL,
+                    headers={"User-Agent": "TinyKullan-Updater/1.0"},
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    self.root.after(0, lambda: _set_result(f"✗ GitHub error {resp.status_code}", SREC))
+                    self.root.after(0, _reset_btn)
+                    return
+
+                data = resp.json()
+                latest_sha = data.get("sha", "")
+                commit_msg = ""
+                try:
+                    commit_msg = data["commit"]["message"].split("\n")[0][:80]
+                except Exception:
+                    pass
+
+                if not latest_sha:
+                    self.root.after(0, lambda: _set_result("✗ Could not read commit SHA", SREC))
+                    self.root.after(0, _reset_btn)
+                    return
+
+                current_sha = self.cfg.last_update_sha
+
+                if current_sha == latest_sha:
+                    self.root.after(0, lambda: _set_result("✓ Already up to date!", SPLAY))
+                    self.root.after(0, _reset_btn)
+                    return
+
+                # New update found - ask user
+                msg = f"Update available!\n\nLatest: {latest_sha[:10]}\nMessage: {commit_msg}\n\nDownload and install now?"
+
+                def _prompt():
+                    if tkinter.messagebox.askyesno("Kullan Updater", msg, parent=self.root):
+                        _reset_btn("  Downloading...  ")
+                        _set_result("Downloading update...", SMUTED)
+                        threading.Thread(target=lambda: _download_and_apply(latest_sha), daemon=True).start()
+                    else:
+                        _set_result("Update skipped.", SMUTED)
+                        _reset_btn()
+
+                self.root.after(0, _prompt)
+
+            except Exception as ex:
+                _LOG.error("Updater check failed: %s", ex)
+                self.root.after(0, lambda: _set_result(f"✗ Network error: {ex}", SREC))
+                self.root.after(0, _reset_btn)
+
+        def _download_and_apply(latest_sha):
+            import shutil
+            import subprocess
+            import tempfile
+            import zipfile
+
+            try:
+                tmp_dir = tempfile.mkdtemp(prefix="TinyKullan_update_")
+                zip_path = os.path.join(tmp_dir, "update.zip")
+
+                # Download the zip
+                self.root.after(0, lambda: _set_result("Downloading zip from GitHub...", SMUTED))
+                r = requests.get(ZIP_URL, headers={"User-Agent": "TinyKullan-Updater/1.0"}, timeout=60, stream=True)
+                r.raise_for_status()
+                with open(zip_path, "wb") as zf:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        zf.write(chunk)
+
+                # Extract
+                self.root.after(0, lambda: _set_result("Extracting...", SMUTED))
+                extract_dir = os.path.join(tmp_dir, "extracted")
+                with zipfile.ZipFile(zip_path, "r") as zref:
+                    zref.extractall(extract_dir)
+
+                # The zip extracts to a folder like TinyKullan-main/
+                inner_dirs = [d for d in os.listdir(extract_dir)
+                              if os.path.isdir(os.path.join(extract_dir, d))]
+                if not inner_dirs:
+                    raise RuntimeError("Unexpected zip structure - no inner directory found")
+                src_dir = os.path.join(extract_dir, inner_dirs[0])
+
+                # Target directory is the parent of TinyKullan\Python
+                # (the root TinyKullan folder)
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                target_dir = os.path.dirname(script_dir)  # TinyKullan root
+
+                ini_path = str(INI_PATH)
+                vbs_path = os.path.join(target_dir, "TinyKullan.vbs")
+
+                # Build the update_helper.bat
+                bat_path = os.path.join(tmp_dir, "update_helper.bat")
+                bat_lines = [
+                    "@echo off",
+                    "title TinyKullan Updater",
+                    "echo Waiting for TinyKullan to close...",
+                    "timeout /t 2 /nobreak >nul",
+                    f'echo Copying files from "{src_dir}" to "{target_dir}"...',
+                    f'xcopy /E /Y /I "{src_dir}\\*" "{target_dir}\\" >nul 2>&1',
+                    f'echo Done. Relaunching...',
+                    f'start "" "{vbs_path}"',
+                    "echo .",
+                    "echo Update complete!",
+                    "timeout /t 2 /nobreak >nul",
+                    '(goto) 2>nul & del "%~f0"',
+                ]
+                with open(bat_path, "w", encoding="utf-8") as bf:
+                    bf.write("\r\n".join(bat_lines) + "\r\n")
+
+                # Save the new SHA to config before exiting
+                self.cfg.last_update_sha = latest_sha
+                self.cfg.save()
+
+                self.root.after(0, lambda: _set_result("✓ Download complete! Restarting...", SPLAY))
+
+                # Launch the bat and exit
+                import subprocess as _sp
+                _sp.Popen(
+                    ["cmd", "/c", "start", "", bat_path],
+                    close_fds=True,
+                    creationflags=getattr(_sp, "CREATE_NEW_CONSOLE", 0),
+                )
+
+                self.root.after(800, lambda: sys.exit(0))
+
+            except Exception as ex:
+                _LOG.error("Updater download/apply failed: %s", ex)
+                self.root.after(0, lambda: _set_result(f"✗ Update failed: {ex}", SREC))
+                self.root.after(0, _reset_btn)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Milestone Alerts ─────────────────────────────────────────────────────
+    def _check_milestones(self, count):
+        """Send a Discord webhook when a run-count milestone is crossed."""
+        try:
+            url = self.cfg.webhook_url.strip()
+            if not url:
+                return
+            thresholds = sorted(self.cfg.milestone_thresholds or [])
+            last_notified = self.cfg.milestone_last_notified
+            hit = None
+            for t in thresholds:
+                if count >= t > last_notified:
+                    hit = t
+            if hit is None:
+                return
+            self.cfg.milestone_last_notified = hit
+            try:
+                self.cfg.save()
+            except Exception:
+                pass
+            milestones_icons = {100: "\U0001f947", 500: "\U0001f948", 1000: "\U0001f3c6", 5000: "\U0001f48e"}
+            icon = milestones_icons.get(hit, "\u2b50")
+            title = f"{icon} Milestone Reached: {hit} Runs!"
+            desc = f"You've completed **{count}** loops total. Keep grinding!"
+            try:
+                wh = DiscordWebhook(url=url, username="TinyKullan")
+                em = DiscordEmbed(title=title, color=0xFFD700, description=desc)
+                em.add_embed_field(name="Milestone", value=str(hit), inline=True)
+                em.add_embed_field(name="Total Runs", value=str(count), inline=True)
+                em.set_timestamp()
+                if self.cfg.mention_id:
+                    wh.content = f"<@{self.cfg.mention_id}>"
+                wh.add_embed(em)
+                wh.execute()
+                _LOG.info("Milestone webhook fired for %d runs", hit)
+            except Exception as we:
+                _LOG.warning("Milestone webhook failed: %s", we)
+        except Exception as ex:
+            _LOG.error("_check_milestones: %s", ex)
+
+    # ── Macro Playlist ───────────────────────────────────────────────────────
+    def start_playlist(self):
+        """Start playlist playback. Chains all queued macro files in order (or random)."""
+        if self.playing or self.looping or self.recording:
+            self.set_status("Macro busy!", _C["rec"], 1500)
+            return
+        files = list(self.cfg.playlist_files or [])
+        if not files:
+            self.set_status("Playlist is empty!", _C["rec"], 1500)
+            return
+        self.playing = True
+        self._stop_ev.clear()
+        self.set_status("\u25b6 Playlist", _C["go"])
+        threading.Thread(target=self._playlist_worker, args=(files,), daemon=True).start()
+
+    def _playlist_worker(self, files):
+        """Worker: plays each macro in the playlist sequentially or randomly."""
+        import random
+        import tempfile
+        import subprocess
+
+        mode = self.cfg.playlist_mode
+        gap_ms = max(0, self.cfg.playlist_gap_ms)
+        if mode == "random":
+            files = files[:]
+            random.shuffle(files)
+
+        ahk_path = _find_autohotkey()
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        ahk_script = os.path.join(script_dir, "TinyKullan.ahk")
+        has_ahk = os.path.exists(ahk_script) and os.path.exists(ahk_path)
+
+        for idx, fpath in enumerate(files):
+            if self._stop_ev.is_set():
+                break
+            if not os.path.exists(fpath):
+                _LOG.warning("Playlist: file not found: %s", fpath)
+                continue
+            name = os.path.basename(fpath)
+            self.root.after(0, lambda n=name, i=idx, total=len(files):
+                self.set_status(f"\u25b6 {i+1}/{total}: {n}", _C["go"]))
+            try:
+                with open(fpath, encoding="utf-8") as f:
+                    first = f.read(1); f.seek(0)
+                    if first == "#":
+                        evs = _read_compact_run(fpath)
+                    else:
+                        evs = [e for e in json.load(f) if _valid_ev(e)]
+            except Exception as e:
+                _LOG.error("Playlist: failed to load %s: %s", fpath, e)
+                continue
+
+            if has_ahk:
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
+                                                     prefix="tkplaylist_", delete=False,
+                                                     encoding="utf-8") as tf:
+                        tmp = tf.name
+                    _write_csv_macro(evs, tmp)
+                    speed = max(0.1, min(10.0, self.cfg.speed))
+                    args = [ahk_path, ahk_script, "/play", tmp]
+                    if speed != 1.0:
+                        args.extend(["/speed", str(speed)])
+                    proc = subprocess.Popen(args, creationflags=0x08000000)
+                    while proc.poll() is None:
+                        if self._stop_ev.is_set():
+                            proc.terminate()
+                            break
+                        time.sleep(0.1)
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                except Exception as ex:
+                    _LOG.error("Playlist AHK error: %s", ex)
+            else:
+                self._replay_inline_events(evs)
+
+            if self._stop_ev.is_set():
+                break
+            if gap_ms > 0:
+                gap_end = time.perf_counter() + gap_ms / 1000.0
+                while time.perf_counter() < gap_end:
+                    if self._stop_ev.is_set():
+                        break
+                    time.sleep(0.05)
+
+        self.playing = False
+        self.root.after(0, self._reset_ui)
+        if not self._stop_ev.is_set():
+            self.root.after(0, lambda: self.set_status("\u2713 Playlist done", _C["go"], 2000))
 
     def _test_webhook(self, url, slbl):
         if not url.strip():
