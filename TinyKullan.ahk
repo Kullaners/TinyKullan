@@ -26,6 +26,7 @@ Global WindowsMouseHook := 0
 Global SpeedMultiplier := 1.0
 Global LastPressTimes := Map()  ; filter OS auto-repeat keys during recording
 Global LastClickTimes := Map()    ; filter OS auto-repeat mouse clicks during recording
+Global IgnoreRecordVks := Map()   ; app hotkeys that must not enter recordings
 
 ; Command line argument parsing
 Global ImgClickX := 0
@@ -42,6 +43,11 @@ for index, arg in A_Args {
         Mode := "Record"
         MacroPath := A_Args[index + 1]
         StopPath := MacroPath ".stop"
+    } else if (arg = "/ignorevk" and index + 1 <= A_Args.Length) {
+        try {
+            IgnoreRecordVks[Integer(A_Args[index + 1])] := True
+        } catch {
+        }
     } else if (arg = "/imgclick" and index + 2 <= A_Args.Length) {
         Mode := "ImgClick"
         ImgClickX := Integer(A_Args[index + 1])
@@ -303,10 +309,10 @@ StopKeyboardHook() {
 }
 
 OnKeyPress(ih, vk, sc, extended := 0) {
-    Global Recording, Events, StartTime, LastPressTimes
+    Global Recording, Events, StartTime, LastPressTimes, IgnoreRecordVks
     if (!Recording)
         Return
-    if (vk = 0x74 || vk = 0x75 || vk = 0x76 || vk = 0x77)  ; skip F5/F6/F7/F8
+    if (vk = 0x74 || vk = 0x75 || vk = 0x76 || vk = 0x77 || IgnoreRecordVks.Has(vk))  ; skip app hotkeys
         Return
 
     ; Filter OS auto-repeats: skip if same VK pressed within last 50ms
@@ -320,10 +326,10 @@ OnKeyPress(ih, vk, sc, extended := 0) {
 }
 
 OnKeyRelease(ih, vk, sc, extended := 0) {
-    Global Recording, Events, StartTime, LastPressTimes
+    Global Recording, Events, StartTime, LastPressTimes, IgnoreRecordVks
     if (!Recording)
         Return
-    if (vk = 0x74 || vk = 0x75 || vk = 0x76 || vk = 0x77)
+    if (vk = 0x74 || vk = 0x75 || vk = 0x76 || vk = 0x77 || IgnoreRecordVks.Has(vk))
         Return
     delay := Round(QPC() - StartTime)
     if (LastPressTimes.Has(vk))
@@ -426,7 +432,7 @@ PlayWorker() {
                     HeldMiddle := (state = "Down")
             } else if (t = "K") {
                 SendKeyInput(ev.vk, ev.sc, ev.s = "Up")
-            } else if (t = "W") {
+            } else if (t = "W" || t = "WH") {
                 ; Move relatively to wheel target, then scroll
                 pt := Buffer(8, 0)
                 DllCall("GetCursorPos", "Ptr", pt)
@@ -437,7 +443,8 @@ PlayWorker() {
                 if (dx != 0 || dy != 0) {
                     SendMouseInput(dx, dy, 0x0001)
                 }
-                SendMouseWheelInput(ev.delta, 0x0800)
+                wheelFlags := (t = "WH") ? 0x1000 : 0x0800
+                SendMouseWheelInput(ev.delta, wheelFlags)
             }
         }
 

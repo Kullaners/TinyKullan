@@ -33,7 +33,7 @@ from pathlib import Path
 
 
 @lru_cache(maxsize=64)
-def get_cached_template(image_path: str):
+def _get_cached_template(image_path: str, modified_ns: int):
     """
     Win 1+4: True LRU cache with lazy imports.
     Python's built-in lru_cache handles eviction correctly (least recently used).
@@ -41,12 +41,25 @@ def get_cached_template(image_path: str):
     """
     import cv2
 
-    if not image_path or not os.path.exists(image_path):
-        return None
     try:
         return cv2.imread(image_path, cv2.IMREAD_COLOR)
     except Exception:
         return None
+
+
+def get_cached_template(image_path: str):
+    """Load a template with an mtime-aware cache.
+
+    The previous cache was keyed only by path, so replacing an image file did
+    not change detection until the process restarted.
+    """
+    if not image_path or not os.path.exists(image_path):
+        return None
+    try:
+        modified_ns = os.stat(image_path).st_mtime_ns
+    except OSError:
+        return None
+    return _get_cached_template(image_path, modified_ns)
 
 
 from tkinter import colorchooser, filedialog, ttk
@@ -398,78 +411,17 @@ def _ahk_imgclick(x, y):
     """Fire a hardware-level left-click at (x, y) using ctypes.
     This bypasses AHK subprocess spawning to prevent click latency and UI freeze."""
     try:
-        user32.SetCursorPos(int(x), int(y))
+        _send_input(_mouse_move(x, y))
         time.sleep(0.005)
-        user32.mouse_event(0x0002, 0, 0, 0, 0)  # left down
+        _send_input(_mouse_button("left", False))
         time.sleep(0.015)
-        user32.mouse_event(0x0004, 0, 0, 0, 0)  # left up
+        _send_input(_mouse_button("left", True))
     except Exception as e:
         _LOG.error("Direct imgclick failed: %s", e)
 
 
 # ── AHK persistent worker (module-level state) ────────────────────────────────
-_ahk_worker_proc = None  # subprocess.Popen handle
-_ahk_worker_script = None  # resolved path to TinyKullan.ahk
-_ahk_worker_lock = None  # threading.Lock, initialised on first use
-
-
-def _get_ahk_worker_lock():
-    global _ahk_worker_lock
-    if _ahk_worker_lock is None:
-        _ahk_worker_lock = threading.Lock()
-    return _ahk_worker_lock
-
-
-def _start_ahk_worker():
-    """Launch TinyKullan.ahk once with /worker and keep the Popen reference."""
-    import subprocess
-
-    global _ahk_worker_proc, _ahk_worker_script
-
-    with _get_ahk_worker_lock():
-        if _ahk_worker_proc is not None and _ahk_worker_proc.poll() is None:
-            return True
-
-        try:
-            ahk = _find_autohotkey()
-            script = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "TinyKullan.ahk"
-            )
-            if not os.path.exists(script):
-                return False
-
-            _ahk_worker_script = script
-            _ahk_worker_proc = subprocess.Popen(
-                [ahk, script, "/worker"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        except Exception:
-            _ahk_worker_proc = None
-            return False
-
-
-def _ahk_send_command(cmd):
-    """Write *cmd* to a temp signal file that the AHK /worker process polls."""
-    global _ahk_worker_proc
-
-    with _get_ahk_worker_lock():
-        if _ahk_worker_proc is None or _ahk_worker_proc.poll() is not None:
-            return False
-
-    try:
-        tmp_dir = (
-            os.environ.get("TEMP")
-            or os.environ.get("TMP")
-            or os.path.dirname(os.path.abspath(__file__))
-        )
-        signal_path = os.path.join(tmp_dir, "TinyKullan_ahk_cmd.txt")
-        with open(signal_path, "w", encoding="utf-8") as fh:
-            fh.write(cmd + "\n")
-        return True
-    except Exception:
-        return False
+# (Worker code removed as requested)
 
 
 def _write_csv_macro(events, filepath):
@@ -487,7 +439,12 @@ def _write_csv_macro(events, filepath):
             scan = int(ev.get("scan", ev.get("sc", 0)))
             ext = 1 if ev.get("ext", False) else 0
             delta = int(ev.get("delta", 0))
-            custom_name = urllib.parse.quote(ev.get("custom_name", ""), safe="")
+            # Image/run events use ``name`` while older hand-authored events
+            # used ``custom_name``. Preserve either spelling in the temporary
+            # transport file so Python fallback playback can round-trip them.
+            custom_name = urllib.parse.quote(
+                ev.get("custom_name") or ev.get("name") or "", safe=""
+            )
             if "up" in ev:
                 # Recorded event: single row with inter-event delay
                 d = int(ev.get("d", 0))
@@ -523,21 +480,26 @@ def _read_csv_macro(filepath):
     events = []
     with open(filepath, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
-        for parts in reader:
+        for row_number, parts in enumerate(reader, start=1):
             if not parts:
                 continue
             if len(parts) < 10:
+                _LOG.warning("Skipping malformed macro row %d", row_number)
                 continue
-            t = parts[0]
-            d = int(parts[1])
-            x = int(parts[2])
-            y = int(parts[3])
-            btn = parts[4]
-            up = parts[5] == "1"
-            vk = int(parts[6])
-            scan = int(parts[7])
-            ext = parts[8] == "1"
-            delta = int(parts[9])
+            try:
+                t = parts[0]
+                d = max(0, int(parts[1]))
+                x = int(parts[2])
+                y = int(parts[3])
+                btn = parts[4]
+                up = parts[5] == "1"
+                vk = int(parts[6])
+                scan = int(parts[7])
+                ext = parts[8] == "1"
+                delta = int(parts[9])
+            except (TypeError, ValueError) as exc:
+                _LOG.warning("Skipping malformed macro row %d: %s", row_number, exc)
+                continue
             custom_name = ""
             if len(parts) >= 11:
                 custom_name = urllib.parse.unquote(parts[10])
@@ -555,6 +517,11 @@ def _read_csv_macro(filepath):
             }
             if custom_name:
                 ev["custom_name"] = custom_name
+                if t in ("I", "image"):
+                    ev["name"] = custom_name
+                    ev["img"] = custom_name
+                elif t in ("R", "run"):
+                    ev["name"] = custom_name
             if t in ("C", "click"):
                 ev["btn"] = btn
             if t in ("K", "key"):
@@ -566,8 +533,9 @@ def _read_csv_macro(filepath):
 
 
 # ── Compact run file format ───────────────────────────────────────────────────
-# TYPE|DURATION|DATA
-# Types: MOVE, MOUSE_DOWN, MOUSE_UP, KEY_DOWN, KEY_UP, SCROLL, SCROLL_H
+# TYPE|DURATION|DATA[|EXTRA...]
+# Types: MOVE, MOUSE_DOWN, MOUSE_UP, KEY_DOWN, KEY_UP, SCROLL, SCROLL_H,
+#        IMAGE, RUN, DELAY
 # Duration: ms since previous event
 #
 
@@ -654,14 +622,23 @@ def _write_compact_run(events, filepath):
                 scan = ev.get("scan", 0)
                 name = _vk_to_compact_name(vk, scan)
                 if name:
-                    f.write(f"{typ}|{d}|{name}\n")
+                    # Keep the original scan code and extended-key bit. Older
+                    # files contain only the readable name, which the reader
+                    # continues to support.
+                    ext = 1 if ev.get("ext", False) else 0
+                    f.write(f"{typ}|{d}|{name}|{scan}|{ext}\n")
                 else:
-                    f.write(f"{typ}|{d}|VK{vk}\n")
+                    ext = 1 if ev.get("ext", False) else 0
+                    f.write(f"{typ}|{d}|VK{vk}|{scan}|{ext}\n")
 
             elif t in ("W", "WH"):
                 typ = "SCROLL_H" if t == "WH" else "SCROLL"
                 delta = ev.get("delta", 0)
-                f.write(f"{typ}|{d}|{delta}\n")
+                x = ev.get("x", 0)
+                y = ev.get("y", 0)
+                # New files carry the pointer location. The reader accepts
+                # the old delta-only representation for backward compatibility.
+                f.write(f"{typ}|{d}|{x},{y}|{delta}\n")
 
             elif t == "I":
                 name = urllib.parse.quote(ev.get("name", ""), safe="")
@@ -740,21 +717,47 @@ def _read_compact_run(filepath):
                         vk = int(key_name[2:])
                     except ValueError:
                         vk = 0
-                events.append({"t": "K", "d": d, "vk": vk, "scan": scan, "up": up})
+                if len(parts) >= 4:
+                    try:
+                        scan = int(parts[3])
+                    except ValueError:
+                        pass
+                ext = False
+                if len(parts) >= 5:
+                    ext = parts[4] == "1"
+                events.append(
+                    {"t": "K", "d": d, "vk": vk, "scan": scan, "ext": ext, "up": up}
+                )
 
             elif typ == "SCROLL":
+                x = y = 0
+                delta_part = parts[2] if len(parts) >= 3 else "0"
+                if "," in delta_part:
+                    try:
+                        x, y = (int(v) for v in delta_part.split(",", 1))
+                        delta_part = parts[3] if len(parts) >= 4 else "0"
+                    except ValueError:
+                        x = y = 0
                 try:
-                    delta = int(parts[2]) if len(parts) >= 3 else 0
+                    delta = int(delta_part)
                 except ValueError:
                     delta = 0
-                events.append({"t": "W", "d": d, "delta": delta})
+                events.append({"t": "W", "d": d, "x": x, "y": y, "delta": delta})
 
             elif typ == "SCROLL_H":
+                x = y = 0
+                delta_part = parts[2] if len(parts) >= 3 else "0"
+                if "," in delta_part:
+                    try:
+                        x, y = (int(v) for v in delta_part.split(",", 1))
+                        delta_part = parts[3] if len(parts) >= 4 else "0"
+                    except ValueError:
+                        x = y = 0
                 try:
-                    delta = int(parts[2]) if len(parts) >= 3 else 0
+                    delta = int(delta_part)
                 except ValueError:
                     delta = 0
-                events.append({"t": "WH", "d": d, "delta": delta})
+                events.append({"t": "WH", "d": d, "x": x, "y": y, "delta": delta})
 
             elif typ == "IMAGE":
                 name = urllib.parse.unquote(parts[2]) if len(parts) >= 3 else ""
@@ -1119,6 +1122,28 @@ RUN_FAV_PATH = BASE_SAVE_PATH / "Saves" / "run_favorites.json"
 IMAGE_DET_JSON = BASE_SAVE_PATH / "Saves" / "image_detection.json"
 IMAGES_PATH = BASE_SAVE_PATH / "Saves" / "images"
 SHOT_PATH = Path(r"C:\TinyKullan\Assets\ScreenShots")
+
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+
+def _copy_image_to_library(source_path):
+    """Copy one image into TinyKullan's managed image library.
+
+    Keeping this operation in one place makes the settings uploader and macro
+    editor use identical validation, destination handling, and cache invalidation.
+    """
+    import shutil
+
+    source = Path(source_path)
+    if not source.is_file():
+        raise FileNotFoundError(str(source))
+    if source.suffix.lower() not in _IMAGE_SUFFIXES:
+        raise ValueError(f"Unsupported image type: {source.suffix or '(none)'}")
+    IMAGES_PATH.mkdir(parents=True, exist_ok=True)
+    destination = IMAGES_PATH / source.name
+    shutil.copy2(source, destination)
+    _get_cached_template.cache_clear()
+    return destination
 _log_path = BASE_SAVE_PATH / "Saves" / "tinykullan.log"
 try:
     _log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1365,7 +1390,7 @@ def _grab_screen(mss_instance=None, monitor_idx=0):
             monitor = monitors[_idx]
             img = mss_instance.grab(monitor)
             return Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX"), monitor
-        with _mss.mss() as sct:
+        with _mss.MSS() as sct:
             monitors = sct.monitors
             _idx = max(0, monitor_idx) if monitor_idx < len(monitors) else 0
             monitor = monitors[_idx]
@@ -1388,6 +1413,17 @@ def _valid_ev(ev):
     if t == "K" and ("vk" not in ev):
         return False
     return True
+
+
+def _requires_python_playback(events):
+    """Return whether the event stream uses features AHK cannot execute.
+
+    AutoHotkey is intentionally kept as the fast/reliable path for raw input
+    events. Image searches, nested runs, and explicit delays are Python
+    features; sending those rows to the AHK CSV loader makes them disappear
+    silently because AHK only understands M/C/K/W/WH rows.
+    """
+    return any(ev.get("t") in {"I", "R", "D"} for ev in events)
 
 
 def _fmt_frog_dur(seconds):
@@ -1568,6 +1604,13 @@ class Config:
         def b(s, k, fb):
             return cfg.getboolean(s, k, fallback=fb)
 
+        def json_list(section, key, fallback):
+            try:
+                value = json.loads(g(section, key, fallback=json.dumps(fallback)))
+                return value if isinstance(value, list) else list(fallback)
+            except Exception:
+                return list(fallback)
+
         self.key_record = g("Hotkeys", "Record", fallback=self.key_record)
         self.key_play = g("Hotkeys", "Play", fallback=self.key_play)
         self.key_loop = g("Hotkeys", "Loop", fallback=self.key_loop)
@@ -1643,31 +1686,23 @@ class Config:
         self.close_minimizes = b("UI", "CloseMinimizes", True)
         self.recorder_overlay = b("UI", "RecorderOverlay", True)
         self.last_update_sha = g("Updater", "LastSHA", fallback="")
-        try:
-            self.pixel_triggers = json.loads(g("PixelTriggers", "Triggers", fallback="[]"))
-        except Exception:
-            self.pixel_triggers = []
-        try:
-            self.ocr_triggers = json.loads(g("OCRTriggers", "Triggers", fallback="[]"))
-        except Exception:
-            self.ocr_triggers = []
+        self.pixel_triggers = json_list("PixelTriggers", "Triggers", [])
+        self.ocr_triggers = json_list("OCRTriggers", "Triggers", [])
         try:
             self.image_det_monitor = int(g("ImageDetection", "MonitorIndex", fallback="0"))
         except ValueError:
             pass
-        try:
-            self.playlist_files = json.loads(g("Playlist", "Files", fallback="[]"))
-        except Exception:
-            self.playlist_files = []
+        self.playlist_files = json_list("Playlist", "Files", [])
         self.playlist_mode = g("Playlist", "Mode", fallback="sequential")
         try:
             self.playlist_gap_ms = int(g("Playlist", "GapMs", fallback="500"))
         except ValueError:
             pass
-        try:
-            self.milestone_thresholds = json.loads(g("Milestones", "Thresholds", fallback="[100, 500, 1000, 5000]"))
-        except Exception:
-            self.milestone_thresholds = [100, 500, 1000, 5000]
+        self.milestone_thresholds = [
+            value
+            for value in json_list("Milestones", "Thresholds", [100, 500, 1000, 5000])
+            if isinstance(value, int) and value > 0
+        ] or [100, 500, 1000, 5000]
         try:
             self.milestone_last_notified = int(g("Milestones", "LastNotified", fallback="0"))
         except ValueError:
@@ -1830,8 +1865,19 @@ class Config:
             "Thresholds": json.dumps(self.milestone_thresholds or [100, 500, 1000, 5000]),
             "LastNotified": str(self.milestone_last_notified),
         }
-        with open(INI_PATH, "w", encoding="utf-8") as f:
-            cfg.write(f)
+        # Replace the config atomically so a power loss or simultaneous quit
+        # cannot leave a half-written INI that resets users' settings.
+        tmp_path = INI_PATH.with_name(INI_PATH.name + ".tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                cfg.write(f)
+            os.replace(tmp_path, INI_PATH)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
 
 class Col:
@@ -2130,12 +2176,6 @@ class HotkeyEntry:
             except Exception:
                 pass
             self._hk_listener = None
-        if self.hook:
-            try:
-                _kb.unhook(self.hook)
-            except Exception:
-                pass
-            self.hook = None
 
     def __del__(self):
         self._stop()
@@ -2159,6 +2199,7 @@ class App:
         self._clicked_this_run = set()
         self.temp_image_det_list = []
         self._stop_ev = threading.Event()
+        self._shutdown_ev = threading.Event()
         self._autoclick_stop_ev = threading.Event()
         self._ev_lock = threading.Lock()
         self._held_vks = set()
@@ -2205,7 +2246,6 @@ class App:
         self._draw_lines = []
         self._current_line = []
         self._is_drawing = False
-        self._mouse_l = self._kb_l = None
         self._hk_vks = set()
         self._currently_pressed_vks = set()
         self._hotkeys_active = set()
@@ -2569,6 +2609,9 @@ class App:
         parts = geo.split("+")
         pos_x = parts[1] if len(parts) > 1 else "100"
         pos_y = parts[2] if len(parts) > 2 else "100"
+
+        # Dynamically update minsize to allow shrinking below 343 width
+        self.root.minsize(calc_w, calc_h)
         self.root.geometry(f"{calc_w}x{calc_h}+{pos_x}+{pos_y}")
 
         # -- Resize title bar (always std height) --
@@ -2579,20 +2622,61 @@ class App:
         self._btn_close.place_configure(x=calc_w - 24, y=0, width=22, height=th)
         self._btn_min.place_configure(x=calc_w - 46, y=0, width=22, height=th)
         self._btn_draw.place_configure(x=calc_w - 68, y=0, width=22, height=th)
-        self._btn_big.place_configure(x=calc_w - 90, y=0, width=22, height=th)
+        if self.cfg.tiny_mode:
+            self._btn_big.place_forget()
+        else:
+            self._btn_big.place_configure(x=calc_w - 90, y=0, width=22, height=th)
 
         # Title bar elements — always standard tiny sizes, just repositioned
         self._ico.place_configure(x=7, y=4, width=20, height=20)
         self._ico.config(font=("Segoe UI Symbol", 11, "bold"))
-        self._title.place_configure(x=30, y=6)
-        self._title.config(font=("Segoe UI", 8, "bold"))
-        self._pill.place_configure(
-            x=120, y=7, width=42, height=14, relx=0.0, anchor="nw"
-        )
-        self._slbl.place_configure(x=0, y=1, width=42, height=12)
-        self._slbl.config(font=("Segoe UI", 5, "bold"))
-        self._btn_runs_top.place_configure(x=164, y=4, width=18, height=18)
-        self._kv_f.place_configure(x=185, y=7, relx=0.0, anchor="nw")
+        
+        if not self.cfg.tiny_mode:
+            self._title.place_configure(x=30, y=6)
+            self._title.config(font=("Segoe UI", 8, "bold"))
+            self._pill.place_configure(
+                x=120, y=7, width=42, height=14, relx=0.0, anchor="nw"
+            )
+            self._slbl.place_configure(x=0, y=1, width=42, height=12)
+            self._slbl.config(font=("Segoe UI", 5, "bold"))
+            self._btn_runs_top.place_configure(x=164, y=4, width=18, height=18)
+            self._kv_f.place_configure(x=185, y=7, relx=0.0, anchor="nw")
+        else:
+            # Tiny Mode title bar layout logic
+            n_visible = len(visible_cols)
+            if n_visible <= 3:
+                self._title.place_forget()
+                self._pill.place_forget()
+                self._kv_f.place_forget()
+                self._btn_runs_top.place_configure(x=(calc_w // 2) - 9, y=4, width=18, height=18)
+            elif n_visible == 4:
+                self._title.place_forget()
+                self._kv_f.place_forget()
+                self._pill.place_configure(
+                    x=30, y=7, width=42, height=14, relx=0.0, anchor="nw"
+                )
+                self._slbl.place_configure(x=0, y=1, width=42, height=12)
+                self._slbl.config(font=("Segoe UI", 5, "bold"))
+                self._btn_runs_top.place_configure(x=76, y=4, width=18, height=18)
+            elif n_visible == 5:
+                self._title.place_forget()
+                self._pill.place_configure(
+                    x=30, y=7, width=42, height=14, relx=0.0, anchor="nw"
+                )
+                self._slbl.place_configure(x=0, y=1, width=42, height=12)
+                self._slbl.config(font=("Segoe UI", 5, "bold"))
+                self._btn_runs_top.place_configure(x=76, y=4, width=18, height=18)
+                self._kv_f.place_configure(x=98, y=7, relx=0.0, anchor="nw")
+            else:
+                self._title.place_configure(x=30, y=6)
+                self._title.config(font=("Segoe UI", 8, "bold"))
+                self._pill.place_configure(
+                    x=120, y=7, width=42, height=14, relx=0.0, anchor="nw"
+                )
+                self._slbl.place_configure(x=0, y=1, width=42, height=12)
+                self._slbl.config(font=("Segoe UI", 5, "bold"))
+                self._btn_runs_top.place_configure(x=164, y=4, width=18, height=18)
+                self._kv_f.place_configure(x=185, y=7, relx=0.0, anchor="nw")
 
         # -- Column buttons --
         hidden_ids = set(id(c) for c in visible_cols)
@@ -2662,19 +2746,7 @@ class App:
             _round_hwnd(self._hwnd)
 
     def _apply_tiny(self):
-        visible = []
-        if not self.cfg.tiny_mode:
-            # Restore pill/slbl to standard bounds regardless of big_mode
-            self._pill.place_configure(
-                x=120, y=8, width=42, height=14, relx=0.0, anchor="nw"
-            )
-            self._slbl.place_configure(x=0, y=2, width=42, height=12)
-            self._slbl.config(font=("Segoe UI", 5, "bold"))
-            for i, (_, col) in enumerate(self._all_cols):
-                col.show(i, big=self.cfg.big_mode)
-            new_w = len(self._all_cols) * CW
-            hide_ctrls = False
-        else:
+        if self.cfg.tiny_mode:
             # Force settings always visible (otherwise user can't access settings)
             self.cfg.tiny_settings = True
             toggle = {
@@ -2693,73 +2765,7 @@ class App:
                 forced = {"record", "play", "settings"}
                 for name in forced:
                     setattr(self.cfg, f"tiny_{name}", True)
-                visible = [
-                    col
-                    for name, col in self._all_cols
-                    if (toggle.get(name, True) or name in forced)
-                ]
-            visible_set = set(id(c) for c in visible)
-            for _, col in self._all_cols:
-                if id(col) not in visible_set:
-                    col.hide()
-            for i, col in enumerate(visible):
-                col.show(i, big=self.cfg.big_mode)
-            new_w = max(len(visible) * CW, 3 * CW)
-            hide_ctrls = False  # Always show min/close/draw controls
-
-        cur = self.root.geometry().split("+")
-        x, y = (cur[1] if len(cur) > 1 else "0"), (cur[2] if len(cur) > 2 else "40")
-        # Use proper height: BIG mode lets _apply_big override, else standard
-        use_h = TH + BH + 22
-        self.root.geometry(f"{new_w}x{use_h}+{x}+{y}")
-        self._tb.place_configure(width=new_w)
-        self._sep.place_configure(width=new_w)
-
-        for lbl, ox in [
-            (self._btn_draw, new_w - 68),
-            (self._btn_min, new_w - 46),
-            (self._btn_close, new_w - 24),
-        ]:
-            try:
-                if hide_ctrls:
-                    lbl.place_forget()
-                else:
-                    lbl.place(x=ox, y=0, width=22, height=TH)
-            except Exception:
-                pass
-
-        if not self.cfg.tiny_mode:
-            self._title.place_configure(x=30)
-            self._pill.place_configure(x=120, y=7, relx=0.0, anchor="nw")
-            self._btn_runs_top.place_configure(x=164, y=4)
-            self._kv_f.place_configure(x=185, y=7, relx=0.0, anchor="nw")
-        else:
-            n_visible = len(visible)
-            if n_visible <= 3:
-                # Hide title text + Ready pill + waiting label, show only hex + runs + min/x
-                self._title.place_forget()
-                self._pill.place_forget()
-                self._kv_f.place_forget()
-                self._btn_runs_top.place_configure(x=(new_w // 2) - 9, y=4)
-            elif n_visible == 4:
-                # Hide title text + key detector, show pill + runs next to hex icon
-                self._title.place_forget()
-                self._kv_f.place_forget()
-                self._pill.place_configure(x=30, y=7, relx=0.0, anchor="nw")
-                self._btn_runs_top.place_configure(x=76, y=4)
-            elif n_visible == 5:
-                # Hide title text, show pill + runs + waiting next to hex icon
-                self._title.place_forget()
-                self._pill.place_configure(x=30, y=7, relx=0.0, anchor="nw")
-                self._btn_runs_top.place_configure(x=76, y=4)
-                self._kv_f.place_configure(x=98, y=7, relx=0.0, anchor="nw")
-            else:
-                self._title.place_configure(x=30)
-                self._pill.place_configure(x=120, y=7, relx=0.0, anchor="nw")
-                self._btn_runs_top.place_configure(x=164, y=4)
-                self._kv_f.place_configure(x=185, y=7, relx=0.0, anchor="nw")
-
-        # Let _build_gui handle the initial _apply_big call
+        self._apply_big()
 
     def _update_status_row(self):
         """Refresh the [active]/[unactive] labels under each button in BIG mode."""
@@ -2949,7 +2955,7 @@ class App:
         t = threading.Thread(target=_tray_thread, daemon=True)
         t.start()
 
-    def _add_tray_icon(self):
+    def _add_tray_icon(self, retry=0):
         if (
             self._tray_added
             or not getattr(self, "_tray_icon", 0)
@@ -2970,7 +2976,11 @@ class App:
                 err = _ct.windll.kernel32.GetLastError()
             except Exception:
                 err = "?"
-            _LOG.warning("Shell_NotifyIconW NIM_ADD failed (err=%s)", err)
+            if retry < 5:
+                # Retry after 500ms - notification area may not be ready yet
+                self.root.after(500, lambda: self._add_tray_icon(retry + 1))
+            else:
+                _LOG.warning("Shell_NotifyIconW NIM_ADD failed (err=%s)", err)
         else:
             self._tray_added = True
 
@@ -3604,6 +3614,7 @@ class App:
             self._blink_after = self.root.after(180, self._anim_tick)
 
     def _quit(self):
+        self._shutdown_ev.set()
         self._stop_recorder_overlay()
         try:
             self.cfg.save()
@@ -3621,14 +3632,6 @@ class App:
             except Exception:
                 _LOG.exception("Failed to terminate AHK playback process")
             self._ahk_proc = None
-        # Terminate AHK persistent worker if active
-        global _ahk_worker_proc
-        if _ahk_worker_proc is not None:
-            try:
-                _ahk_worker_proc.terminate()
-            except Exception:
-                _LOG.exception("Failed to terminate AHK worker process")
-            _ahk_worker_proc = None
         # Release ALL held keys — prevent stuck modifiers
         try:
             self._release_held()
@@ -3699,13 +3702,6 @@ class App:
                 )
         except Exception:
             pass
-        # Bug 1: Stop pynput mouse listener if active
-        if self._mouse_l:
-            try:
-                self._mouse_l.stop()
-            except Exception:
-                pass
-
         # Bug 15: Stop the global keyboard listener so the process can exit cleanly
         if self._global_kb_listener:
             try:
@@ -3890,7 +3886,9 @@ class App:
             return
 
         triggered_func = None
-        triggered_func = self._hotkey_map.get(vk)
+        has_mods = any(mod in self._currently_pressed_vks for mod in {0x10, 0xA0, 0xA1, 0x11, 0xA2, 0xA3, 0x12, 0xA4, 0xA5, 0x5B, 0x5C})
+        if not has_mods:
+            triggered_func = self._hotkey_map.get(vk)
         if not triggered_func:
             for hk_vk_set, func, hk_name in self._hotkey_defs:
                 matched = True
@@ -3949,7 +3947,6 @@ class App:
         elif vk == 0x12:
             self._currently_pressed_vks.difference_update({0xA4, 0xA5})
 
-        # AHK handles recording; don't record releases either
         if not self.recording:
             self._on_key_release(key)
 
@@ -3977,7 +3974,6 @@ class App:
 
     def _panic(self):
         _LOG.warning("PANIC STOP")
-        # Bug 14: Add _stop_listeners method
         self._stop_listeners()
         self.recording = False
         self._stop_ev.set()
@@ -3997,20 +3993,8 @@ class App:
         self.root.after(0, self._reset_ui)
         self.root.after(0, lambda: self.set_status("⚠ PANIC", _C["rec"], 5000))
 
-    # Bug 14
     def _stop_listeners(self):
-        if self._mouse_l:
-            try:
-                self._mouse_l.stop()
-            except Exception:
-                pass
-            self._mouse_l = None
-        if self._kb_l:
-            try:
-                self._kb_l.stop()
-            except Exception:
-                pass
-            self._kb_l = None
+        pass
 
     def toggle_record(self):
         if self.playing or self.looping or getattr(self, "running_all_images", False):
@@ -4098,8 +4082,29 @@ class App:
 
             import subprocess
 
+            # Prevent the configured app hotkeys from being captured as macro
+            # input. The old recorder only excluded hard-coded F5-F8, so a
+            # custom hotkey such as Ctrl+R was saved into every recording.
+            ignore_vks = set()
+            for hotkey in (
+                self.cfg.key_record,
+                self.cfg.key_play,
+                self.cfg.key_loop,
+                self.cfg.key_save,
+                self.cfg.key_autoclick,
+                self.cfg.key_pause,
+                self.cfg.key_stop,
+            ):
+                for part in str(hotkey or "").lower().replace(" ", "").split("+"):
+                    vk = _name_to_vk(part)
+                    if vk:
+                        ignore_vks.add(vk)
+
+            ahk_args = [ahk_path, ahk_script, "/record", macro_temp]
+            for vk in sorted(ignore_vks):
+                ahk_args.extend(["/ignorevk", str(vk)])
             self._ahk_proc = subprocess.Popen(
-                [ahk_path, ahk_script, "/record", macro_temp],
+                ahk_args,
                 creationflags=0x08000000 if sys.platform == "win32" else 0,
             )
 
@@ -4111,18 +4116,24 @@ class App:
             _LOG.error("AHK not found: %s", e)
             self.set_status("AHK not installed - run install.bat", _C["rec"], 4000)
             self.recording = False
+            self.c_rec.set_active(False)
             self.c_rec.ico.config(text=self.cfg.ico_record)
             self.c_rec.lbl.config(text="Record")
+            self.root.after(0, self._update_status_row)
         except Exception as e:
             _LOG.error("Failed to start AHK recorder: %s", e)
             self.set_status("Record failed", _C["rec"], 3000)
             self.recording = False
+            self.c_rec.set_active(False)
             self.c_rec.ico.config(text=self.cfg.ico_record)
             self.c_rec.lbl.config(text="Record")
+            self.root.after(0, self._update_status_row)
 
     def _stop_recording(self):
         if not self.recording:
             return
+        import subprocess
+
         self._stop_recorder_overlay()
         if self._blink_after is not None:
             self.root.after_cancel(self._blink_after)
@@ -4169,6 +4180,16 @@ class App:
                 os.remove(macro_temp)
             except Exception:
                 pass
+
+        stop_temp = getattr(self, "_record_stop_temp", "")
+        if stop_temp:
+            try:
+                if os.path.exists(stop_temp):
+                    os.remove(stop_temp)
+            except OSError:
+                _LOG.debug("Could not remove recorder stop marker: %s", stop_temp)
+        self._record_macro_temp = ""
+        self._record_stop_temp = ""
 
         self.c_rec.set_active(False)
         self.root.after(0, self._update_status_row)
@@ -4495,8 +4516,60 @@ class App:
         self._pause_playback = False
         self._loop_warn_active = False
 
+    def _python_playback_worker(self, events, loop):
+        """Play feature-rich event streams that cannot be represented in AHK.
+
+        AHK remains the preferred path for raw input because it has tighter
+        timing, but it intentionally ignores Python-only event types. Keeping
+        this fallback explicit prevents image/run/delay events from vanishing
+        without an error.
+        """
+        started = time.perf_counter()
+        iterations = 0
+        failed = False
+        try:
+            while not self._stop_ev.is_set():
+                iterations += 1
+                self._replay_inline_events(events)
+                if not loop or self._stop_ev.is_set():
+                    break
+                self.root.after(
+                    0,
+                    lambda n=iterations: self.set_status(
+                        f"∞ {n} loops", _C["go"], 2000
+                    ),
+                )
+        except Exception:
+            failed = True
+            _LOG.exception("Python playback failed")
+            self.root.after(0, lambda: self.set_status("Playback failed", _C["rec"], 3000))
+        finally:
+            was_stopped = self._stop_ev.is_set()
+            with self._recover_lock:
+                recovering = self._recovering
+            if not recovering:
+                self.playing = self.looping = False
+                self.root.after(0, self._reset_ui)
+                if not was_stopped and not failed:
+                    play_ms = int((time.perf_counter() - started) * 1000)
+                    threading.Thread(
+                        target=self._post_play,
+                        args=(play_ms, loop),
+                        daemon=True,
+                    ).start()
+
     def _ahk_playback_worker(self, loop):
         t0 = time.perf_counter()
+        with self._ev_lock:
+            evs_snapshot = list(self.events)
+
+        # Python-only events do not require AutoHotkey. Decide this before
+        # checking for the executable so image/run macros still work on a
+        # machine where only the Python dependencies are installed.
+        if _requires_python_playback(evs_snapshot):
+            self._python_playback_worker(evs_snapshot, loop)
+            return
+
         ahk_path = _find_autohotkey()
         script_dir = os.path.dirname(os.path.abspath(__file__))
         ahk_script = os.path.join(script_dir, "TinyKullan.ahk")
@@ -4525,8 +4598,6 @@ class App:
             macro_temp = os.path.join(script_dir, f"temp_macro_{os.getpid()}.txt")
             _cleanup_macro_temp = macro_temp
 
-        with self._ev_lock:
-            evs_snapshot = list(self.events)
         _write_csv_macro(evs_snapshot, macro_temp)
 
         speed = max(0.1, min(10.0, self.cfg.speed))
@@ -4550,6 +4621,7 @@ class App:
                 pass
 
         def _finish(err=None):
+            was_stopped = self._stop_ev.is_set()
             if self._ahk_proc is not None:
                 try:
                     self._ahk_proc.terminate()
@@ -4571,12 +4643,18 @@ class App:
                 )
             else:
                 self.root.after(0, lambda: self.set_status("✓ Done", _C["go"], 1500))
-            threading.Thread(
-                target=self._post_play, args=(play_ms, loop), daemon=True
-            ).start()
+            # A user-initiated stop is not a completed run and should not
+            # inflate statistics or trigger a completion webhook.
+            if not was_stopped and not err:
+                threading.Thread(
+                    target=self._post_play, args=(play_ms, loop), daemon=True
+                ).start()
 
-        def _on_ahk_done():
+        def _on_ahk_done(return_code=0):
             self._ahk_proc = None
+            if return_code not in (0, None):
+                _finish(f"Playback failed (exit {return_code})")
+                return
             iteration[0] += 1
             # Reset per-iteration image dedup so looped runs re-detect images
             with self._click_lock:
@@ -4618,7 +4696,7 @@ class App:
             if ret is None:
                 self.root.after(100, _poll)
             else:
-                _on_ahk_done()
+                _on_ahk_done(ret)
 
         self.root.after(0, _spawn)
 
@@ -5048,7 +5126,7 @@ h1{{font-size:30px}}
             self.set_status("Dashboard: http://127.0.0.1:9270", _C["acc"], 5000)
             webbrowser.open("http://127.0.0.1:9270")
         except OSError as e:
-            if e.winerror == 10048 or getattr(e, "errno", None) == 98:
+            if getattr(e, "winerror", None) == 10048 or getattr(e, "errno", None) == 98:
                 self.set_status("Dashboard: http://127.0.0.1:9270", _C["acc"], 5000)
                 webbrowser.open("http://127.0.0.1:9270")
             else:
@@ -5457,6 +5535,7 @@ h1{{font-size:30px}}
                     self._cv.bind(event, callback)
 
         lb = VirtualEventList(list_frame)
+        lb._master = self  # give the list a reference to App so _do_pen_click works
 
         # Wire ctrl+drag reorder callback: swap actual events and refresh
         # S-11 fix: save_state() is called once at drag start, not on every swap
@@ -6177,11 +6256,7 @@ h1{{font-size:30px}}
                                 src_file = Path(custom_folder_path[0]) / name
                                 if src_file.is_file():
                                     try:
-                                        import shutil
-
-                                        IMAGES_PATH.mkdir(parents=True, exist_ok=True)
-                                        shutil.copy2(src_file, IMAGES_PATH / name)
-                                        get_cached_template.cache_clear()
+                                        _copy_image_to_library(src_file)
                                     except Exception as e:
                                         _LOG.error(
                                             "Failed to copy image to IMAGES_PATH: %s", e
@@ -7201,8 +7276,11 @@ h1{{font-size:30px}}
         ent.bind("<Return>", lambda _: _confirm())
 
     def _load_events(self, path):
+        # Do not leave an old macro active when loading an empty/corrupt file.
+        with self._ev_lock:
+            self.events = []
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 first_char = f.read(1)
                 f.seek(0)
                 if first_char == "#":
@@ -7519,8 +7597,8 @@ h1{{font-size:30px}}
                     self.set_status("Name exists", _C["rec"], 1500)
                     return
                 try:
-                    rp.rename(new_path)
                     old_name = rp.name
+                    rp.rename(new_path)
                     if old_name in favs:
                         favs.discard(old_name)
                         favs.add(new_path.name)
@@ -7598,6 +7676,9 @@ h1{{font-size:30px}}
                 return
             favs.discard(rp.name)
             _save_favs()
+            if Path(self.cfg.save_path).resolve() == rp.resolve():
+                self.cfg.save_path = ""
+                self.cfg.save()
             _refresh_runs()
             if not runs:
                 self.cfg.save_path = ""
@@ -7760,7 +7841,10 @@ h1{{font-size:30px}}
         try:
             if IMAGE_DET_JSON.exists():
                 with open(IMAGE_DET_JSON, "r", encoding="utf-8") as f:
-                    self.image_det_list = json.load(f)
+                    data = json.load(f)
+                if not isinstance(data, list):
+                    raise ValueError("image detection data must be a list")
+                self.image_det_list = [item for item in data if isinstance(item, dict)]
             else:
                 self.image_det_list = []
         except Exception as e:
@@ -7770,24 +7854,39 @@ h1{{font-size:30px}}
     def save_image_detection(self):
         try:
             IMAGE_DET_JSON.parent.mkdir(parents=True, exist_ok=True)
-            with open(IMAGE_DET_JSON, "w", encoding="utf-8") as f:
+            tmp_path = IMAGE_DET_JSON.with_name(IMAGE_DET_JSON.name + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.image_det_list, f, indent=4)
+            os.replace(tmp_path, IMAGE_DET_JSON)
         except Exception as e:
             _LOG.error("Failed to save image detection: %s", e)
+        finally:
+            try:
+                if 'tmp_path' in locals() and tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
     def _image_search_worker(self):
         # BUG-3 fix: outer restart loop — if the inner loop crashes, restart after 2s
-        while True:
+        while not self._shutdown_ev.is_set():
             try:
                 self._image_search_loop()
             except Exception as e:
                 _LOG.error("Image search worker crashed, restarting: %s", e)
-            time.sleep(2.0)
+                mss_instance = getattr(self, "_persistent_mss", None)
+                if mss_instance is not None:
+                    try:
+                        mss_instance.close()
+                    except Exception:
+                        pass
+                    self._persistent_mss = None
+            self._shutdown_ev.wait(2.0)
 
     def _image_search_loop(self):
         # M-2 fix: persistent mss instance inside try so init failure doesn't kill thread
         try:
-            self._persistent_mss = _mss.mss()
+            self._persistent_mss = _mss.MSS()
         except Exception as e:
             _LOG.error("mss init failed: %s", e)
             self._persistent_mss = None
@@ -7796,7 +7895,7 @@ h1{{font-size:30px}}
         last_check = 0.0
         last_disc_check = 0.0
         last_pixel_check = 0.0
-        while True:
+        while not self._shutdown_ev.is_set():
             try:
                 now = time.time()
                 # Run image detection during playback, loop, OR recording (if enabled)
@@ -7840,6 +7939,14 @@ h1{{font-size:30px}}
             except Exception as e:
                 _LOG.error("Error in image search loop: %s", e)
             time.sleep(0.1)
+
+        mss_instance = getattr(self, "_persistent_mss", None)
+        if mss_instance is not None:
+            try:
+                mss_instance.close()
+            except Exception:
+                pass
+            self._persistent_mss = None
 
     def _find_best_match(self, screen_bgr, template_bgr, use_roi=True, roi_key=None):
         import cv2
@@ -8783,6 +8890,9 @@ h1{{font-size:30px}}
         snap = {k: getattr(self.cfg, k) for k in self.cfg.DEFAULTS}
         snap["theme"] = dict(self.cfg.theme)
         self.temp_image_det_list = [dict(x) for x in self.image_det_list]
+        self.temp_pixel_triggers = list(getattr(self.cfg, "pixel_triggers", []))
+        self.temp_ocr_triggers = list(getattr(self.cfg, "ocr_triggers", []))
+        self.temp_playlist_files = list(getattr(self.cfg, "playlist_files", []))
 
         def _close(*_):
             for sf in self._scroll_frames:
@@ -10247,15 +10357,10 @@ h1{{font-size:30px}}
             if not file_paths:
                 return
 
-            import shutil
-
             try:
-                IMAGES_PATH.mkdir(parents=True, exist_ok=True)
                 for file_path in file_paths:
                     src_path = Path(file_path)
-                    dest_path = IMAGES_PATH / src_path.name
-                    shutil.copy2(src_path, dest_path)
-                    get_cached_template.cache_clear()
+                    dest_path = _copy_image_to_library(src_path)
 
                     new_tgt = {
                         "path": str(dest_path),
@@ -10265,9 +10370,17 @@ h1{{font-size:30px}}
                         "enabled": True,
                     }
                     self.temp_image_det_list.append(new_tgt)
+                self.root.after(
+                    0,
+                    lambda n=len(file_paths): sstat.config(
+                        text=f"Added {n} image target{'s' if n != 1 else ''}",
+                        fg=SPLAY,
+                    ),
+                )
                 _render_image_list()
             except Exception as e:
                 _LOG.error("Failed to add target images: %s", e)
+                sstat.config(text=f"Upload failed: {e}", fg=SREC)
 
         btn_container = tk.Frame(inn6, bg=SBG)
         btn_container.pack(fill="x", padx=PX, pady=10)
